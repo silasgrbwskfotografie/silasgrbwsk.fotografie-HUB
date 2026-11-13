@@ -1,0 +1,28 @@
+# Betrieb auf dem Server hinter dem zentralen Caddy (/opt/docker/proxy), Ablage: /opt/docker/apps/app2
+# Kein "ports:", erreichbar nur über das Docker-Netzwerk "proxy".
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  studio-tool:
+    build: .
+    image: studio-tool:latest
+    container_name: studio-tool
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STUDIO_SECURE_COOKIES: "1"
+      STUDIO_TRUST_PROXY: "1"
+    volumes:
+      - ./data:/data
+    expose:
+      - "3000"
+    networks: [proxy]
+    logging: *logging
+
+networks:
+  proxy:
+    external: true

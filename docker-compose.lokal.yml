@@ -1,0 +1,12 @@
+# Nur zum lokalen Ausprobieren (ohne Caddy, ohne HTTPS):
+#   docker compose -f docker-compose.lokal.yml up --build
+# Danach http://127.0.0.1:3000 öffnen. Nie auf dem Server verwenden.
+services:
+  studio-tool:
+    build: .
+    container_name: studio-tool-lokal
+    env_file: .env
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:3000:3000"

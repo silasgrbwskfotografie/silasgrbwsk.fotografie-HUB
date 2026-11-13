@@ -1,0 +1,9 @@
+data
+.env
+.git
+.gitignore
+.claude
+__pycache__
+tests
+*.md
+*.zip
