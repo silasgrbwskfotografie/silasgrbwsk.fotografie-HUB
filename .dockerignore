@@ -7,3 +7,5 @@ __pycache__
 tests
 *.md
 *.zip
+Start.bat
+.gitattributes

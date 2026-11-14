@@ -15,7 +15,7 @@ Ersten Benutzer anlegen (fragt das Passwort verdeckt ab, mindestens 10 Zeichen):
 python server.py adduser silas
 ```
 
-Server starten:
+Server starten: `Start.bat` doppelklicken, oder in PowerShell:
 
 ```
 python server.py
