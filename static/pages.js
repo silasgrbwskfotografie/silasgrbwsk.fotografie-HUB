@@ -74,7 +74,14 @@ function editRecord(table, title, fields, rec = {}, opts = {}) {
     try {
       let body = { ...readForm(form, fields), ...(opts.fix || {}) };
       if (opts.umwandeln) body = opts.umwandeln(body);
-      const r = await api(url, rec.id ? 'PUT' : 'POST', body);
+      let r;
+      try { r = await api(url, rec.id ? 'PUT' : 'POST', body); }
+      catch (e) {
+        if (!/ist gesperrt/.test(e.message)) throw e;
+        const grund = prompt(e.message + '\n\nGrund für die Änderung:');
+        if (!grund) return;
+        r = await api(url, rec.id ? 'PUT' : 'POST', { ...body, sperr_grund: grund });
+      }
       try {
         for (const f of fields.filter(x => x.type === 'file')) {
           const file = form.elements[f.key].files[0];
@@ -93,7 +100,13 @@ function editRecord(table, title, fields, rec = {}, opts = {}) {
     try {
       if (act === 'arch') { await api(url, 'PUT', { archiviert: rec.archiviert ? 0 : 1 }); fertig(rec.archiviert ? 'Wiederhergestellt' : 'Archiviert', 'arch'); }
       if (act === 'del' && confirm('Diesen Eintrag endgültig löschen? Das lässt sich nicht rückgängig machen.')) {
-        await api(url, 'DELETE');
+        try { await api(url, 'DELETE'); }
+        catch (e) {
+          if (!/ist gesperrt/.test(e.message)) throw e;
+          const grund = prompt(e.message + '\n\nGrund für das Löschen:');
+          if (!grund) return;
+          await api(url + '?grund=' + encodeURIComponent(grund), 'DELETE');
+        }
         fertig('Gelöscht', 'del');
       }
     } catch (e) { toast(e.message); }
@@ -1277,6 +1290,95 @@ async function mailkontenKarte(box) {
     }
   });
 }
+
+/* ---------- Ausgaben und Steuer-Vorbereitung (keine amtliche Buchhaltung) ---------- */
+const ZAHLARTEN_AUSGABE = ['Überweisung', 'Karte', 'Lastschrift', 'PayPal', 'Bar'];
+function ausgabeDialog(x, kategorien, auftraege) {
+  const felder = [
+    { key: 'datum', label: 'Datum des Belegs', type: 'date' },
+    { key: 'betrag_cent', label: 'Betrag brutto in Euro', type: 'euro' },
+    { key: 'lieferant', label: 'Lieferant oder Händler' },
+    { key: 'kategorie_id', label: 'Kategorie', type: 'select', options: [['', 'ohne']].concat(kategorien.filter(k => k.aktiv || k.id === x.kategorie_id).map(k => [k.id, k.name])) },
+    { key: 'steuersatz', label: 'Steuersatz', type: 'select', options: [['', 'nicht angegeben'], ['19', '19 %'], ['7', '7 %'], ['0', '0 %']] },
+    { key: 'steuer_cent', label: 'Steuerbetrag in Euro', type: 'euro' },
+    { key: 'zahlart', label: 'Zahlart', type: 'select', options: [['', 'nicht angegeben']].concat(ZAHLARTEN_AUSGABE.map(z => [z, z])) },
+    { key: 'auftrag_id', label: 'Zu Auftrag (optional)', type: 'select', options: [['', 'ohne']].concat(auftraege.filter(a => !a.archiviert || a.id === x.auftrag_id).slice(-200)
+      .map(a => [a.id, `${datum(a.datum)} ${a.begegnung || ''}`])) },
+    { key: 'anlagegut', label: 'Anlagegut (zum Beispiel Kamera, Objektiv): Abschreibung legt die Steuerberatung fest', type: 'check', full: true },
+    { key: 'datei', label: 'Beleg (PDF oder Foto)', type: 'file', accept: 'application/pdf,image/jpeg,image/png', full: true },
+    { key: 'notiz', label: 'Notiz', type: 'textarea', full: true },
+  ];
+  editRecord('ausgaben', x.id ? 'Ausgabe bearbeiten' : 'Ausgabe erfassen', felder, { ...x, datei: x.datei_name }, {
+    extra: '<p class="muted small">Datum oder Betrag können fehlen, der Beleg erscheint dann als unvollständig. Den Steuerbetrag rechnet das Tool als Vorschlag aus Betrag und Satz.</p>',
+    bind: (form) => {   // Steuerbetrag vorschlagen, solange er leer ist: brutto * Satz / (100 + Satz)
+      const el = form.elements;
+      const vorschlag = () => {
+        if (el.steuer_cent.value || !el.steuersatz.value) return;
+        try { const b = centVon(el.betrag_cent.value), satz = Number(el.steuersatz.value); if (b !== '') el.steuer_cent.value = euroEingabe(Math.round(b * satz / (100 + satz))); } catch { /* Betrag noch unvollständig */ }
+      };
+      el.steuersatz.addEventListener('change', vorschlag);
+      el.betrag_cent.addEventListener('change', vorschlag);
+    },
+  });
+}
+
+App.pages.ausgaben = async (view) => {
+  const jahr = Filter.eJahr || new Date().getFullYear();
+  const [e, ausgaben, kategorien, auftraege] = await Promise.all([api('euer?jahr=' + jahr), api('ausgaben'), api('ausgaben_kategorien'), api('auftraege')]);
+  const kname = id => byId(kategorien, id)?.name || '';
+  const unvollst = ausgaben.filter(x => !x.datum || x.betrag_cent === null);
+  const imJahr = ausgaben.filter(x => (x.datum || '').startsWith(String(jahr)));
+  const jahre = [...new Set([new Date().getFullYear(), jahr, ...ausgaben.map(x => Number((x.datum || '').slice(0, 4))).filter(Boolean)])].sort((a, b) => b - a);
+  const zeile = x => `<tr><td class="nowrap">${x.datum ? datum(x.datum) : '<span class="badge warn">ohne Datum</span>'}</td>
+    <td><button type="button" class="linkbtn" data-ausgabe="${x.id}"><b>${esc(x.lieferant || 'ohne Lieferant')}</b></button>
+      <br><span class="muted small">${esc(kname(x.kategorie_id))}${x.anlagegut ? ' · Anlagegut' : ''}${x.notiz ? ' · ' + esc(x.notiz.slice(0, 60)) : ''}</span></td>
+    <td class="num">${x.betrag_cent === null ? '<span class="badge warn">ohne Betrag</span>' : euro(x.betrag_cent)}</td>
+    <td class="num">${x.datei ? `<a class="btn sm" href="/api/datei/ausgaben/${x.id}" target="_blank" rel="noopener">Beleg</a>` : '<span class="muted small">kein Beleg</span>'}</td></tr>`;
+  const von = `${jahr}-01-01`, bis = `${jahr}-12-31`;
+  view.innerHTML = head('Ausgaben und Steuer', 'Vorbereitung für Finom und die Steuerberatung, keine amtliche Buchhaltung und keine Abgabe ans Finanzamt')
+    + `<div class="toolbar"><button class="btn primary" id="eNeu">Ausgabe erfassen</button>
+      <select class="input sm" id="eJahr" aria-label="Jahr">${jahre.map(j => `<option${j === jahr ? ' selected' : ''}>${j}</option>`).join('')}</select></div>
+    <div class="grid">
+      ${unvollst.length ? `<div class="card" id="eUnv"><h2>Unvollständig (${unvollst.length})</h2><table class="tbl"><tbody>${unvollst.map(zeile).join('')}</tbody></table></div>` : ''}
+      <div class="card"><h2>Übersicht ${jahr} im Aufbau einer EÜR</h2>
+        <div class="tbl-wrap"><table class="tbl" id="eEuer"><thead><tr><th>Monat</th><th class="num">Einnahmen</th><th class="num">Ausgaben</th><th class="num">Ergebnis</th><th>Monat abschließen</th></tr></thead><tbody>
+        ${MONATSNAMEN.map((mn, i) => { const m = `${jahr}-${String(i + 1).padStart(2, '0')}`; const zu = e.gesperrt.includes(m); return `<tr>
+          <td>${mn}</td><td class="num">${euro(e.einnahmen[i])}</td><td class="num">${euro(e.ausgaben[i])}</td><td class="num ${e.ergebnis[i] < 0 ? 'rot' : ''}">${euro(e.ergebnis[i])}</td>
+          <td>${zu ? `<span class="badge ok">gesperrt</span> <button type="button" class="btn sm" data-entsperren="${m}">Entsperren</button>` : `<button type="button" class="btn sm" data-sperren="${m}">Sperren</button>`}</td></tr>`; }).join('')}
+        <tr class="summe"><td><b>Jahr</b></td><td class="num"><b>${euro(e.summe.einnahmen)}</b></td><td class="num"><b>${euro(e.summe.ausgaben)}</b></td>
+          <td class="num"><b>${euro(e.summe.ergebnis)}</b></td><td></td></tr></tbody></table></div>
+        <p class="muted small">Einnahmen: bezahlte Zahlungen nach Zahldatum. Ausgaben nach Belegdatum, ohne Anlagegüter.
+          Anlagegüter ${jahr}: <b>${euro(e.summe.anlagegueter)}</b>, die Abschreibung legt die Steuerberatung fest. Gesperrte Monate lassen sich nur mit Grund ändern, er steht im Protokoll.</p>
+        ${e.kategorien.length ? `<h2 class="zwischen">Ausgaben je Kategorie</h2><table class="tbl"><tbody>${e.kategorien.map(([k, , sum]) => `<tr><td>${esc(k)}</td><td class="num">${euro(sum)}</td></tr>`).join('')}</tbody></table>` : ''}</div>
+      <div class="card" id="eListe"><h2>Ausgaben ${jahr} (${imJahr.length})</h2>${imJahr.length ? `<table class="tbl"><tbody>${imJahr.map(zeile).join('')}</tbody></table>` : '<p class="muted">Noch keine Ausgaben in diesem Jahr.</p>'}</div>
+      <div class="card"><h2>Export</h2>
+        <div class="toolbar"><label class="check">von <input class="input sm" type="date" id="exVon" value="${von}"></label><label class="check">bis <input class="input sm" type="date" id="exBis" value="${bis}"></label></div>
+        <div class="btn-row"><a class="btn sm" data-export="einnahmen.csv">Einnahmen (CSV)</a><a class="btn sm" data-export="ausgaben.csv">Ausgaben (CSV)</a><a class="btn sm" data-export="belege.zip">Belege (ZIP)</a></div>
+        <p class="muted small">CSV mit Semikolon für Excel, Beträge mit Komma. Belege im ZIP heißen Datum_Lieferant_Betrag. Fahrten kommen aus dem Fahrtenbuch. DATEV nur, wenn die Steuerberatung es verlangt.</p></div>
+      <div class="card" id="eKat"><h2>Kategorien</h2><ul class="kontakte">${kategorien.map(k => `<li><button type="button" class="linkbtn" data-kat="${k.id}">${esc(k.name)}</button>${k.aktiv ? '' : ' <span class="badge plain">aus</span>'}</li>`).join('')}</ul>
+        <button type="button" class="btn sm" id="katNeu">Kategorie hinzufügen</button><p class="muted small">Welche Kategorien gelten, mit der Steuerberatung abstimmen.</p></div>
+    </div>`;
+  const katFelder = [{ key: 'name', label: 'Name', required: true }, { key: 'sort', label: 'Reihenfolge', type: 'number' }, { key: 'aktiv', label: 'Aktiv', type: 'check', def: 1 }];
+  const exportLinks = () => $$('[data-export]', view).forEach(l => { l.href = `/api/export/${l.dataset.export}?von=${$('#exVon').value}&bis=${$('#exBis').value}`; });
+  exportLinks();
+  $('#exVon').addEventListener('change', exportLinks);
+  $('#exBis').addEventListener('change', exportLinks);
+  $('#eNeu').addEventListener('click', () => ausgabeDialog({ datum: isoTag(new Date()) }, kategorien, auftraege));
+  $('#eJahr').addEventListener('change', (ev) => { Filter.eJahr = Number(ev.target.value); router(); });
+  $('#katNeu').addEventListener('click', () => editRecord('ausgaben_kategorien', 'Kategorie hinzufügen', katFelder));
+  $('.grid', view).addEventListener('click', async (ev) => {
+    const b = ev.target.closest('button')?.dataset || {};
+    if (b.ausgabe) ausgabeDialog(byId(ausgaben, b.ausgabe), kategorien, auftraege);
+    if (b.kat) editRecord('ausgaben_kategorien', 'Kategorie bearbeiten', katFelder, byId(kategorien, b.kat));
+    if (b.sperren && confirm(`Monat ${b.sperren.slice(5)}.${b.sperren.slice(0, 4)} abschließen? Danach sind Änderungen nur mit Grund möglich.`)) {
+      try { await api('sperren', 'POST', { monat: b.sperren }); toast('Monat gesperrt'); router(); } catch (e) { toast(e.message); }
+    }
+    if (b.entsperren) {
+      const grund = prompt('Grund für das Entsperren (steht im Protokoll):');
+      if (grund) { try { await api(`sperren/${b.entsperren}?grund=${encodeURIComponent(grund)}`, 'DELETE'); toast('Entsperrt'); router(); } catch (e) { toast(e.message); } }
+    }
+  });
+};
 
 /* ---------- App auf dem Home-Bildschirm und Push (nach dem Vorbild des Hubs) ---------- */
 /* iPhone: Push geht nur, wenn das Tool als App auf dem Home-Bildschirm liegt (ab iOS 16.4) */

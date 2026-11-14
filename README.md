@@ -3,7 +3,8 @@
 Interne Arbeitsoberfläche für Aufträge, Zahlungen, Bildauslieferung und Verträge.
 Regeln und Server: `CLAUDE.md`. Funktionsumfang und Bauphasen: `PLANUNG.md`.
 
-Stand: **Phase 9** (Postfach aus dem Hub übernommen: mehrere Mailkonten, live per IMAP, Lesen nur als Text, Antworten, Weiterleiten, Erledigt, Löschen, Push bei neuen Mails, Kundenerkennung, Auftrag, Termin oder Aufgabe aus einer Mail, Textvorlagen).
+Stand: **Phase 10** (Ausgaben mit Beleg als PDF oder Foto, Kategorien, Anlagegüter, Übersicht im Aufbau einer EÜR, Monatssperre mit Grund im Protokoll, Export von Einnahmen und Ausgaben als CSV und Belegen als ZIP).
+Davor Phase 9: Postfach aus dem Hub übernommen: mehrere Mailkonten, live per IMAP, Lesen nur als Text, Antworten, Weiterleiten, Erledigt, Löschen, Push bei neuen Mails, Kundenerkennung, Auftrag, Termin oder Aufgabe aus einer Mail, Textvorlagen.
 Davor Phase 8: Eigene Termine mit Wiederholung und Erinnerung, Kalender mit Woche und Tag, Warnung bei Überschneidungen, Aufgaben mit Ansichten und Vorlagen je Paket, wiederkehrende Aufgaben, Push-Erinnerungen, fremder Kalender per ICS-Link.
 Davor Phase 7: iPhone-App: Manifest, App-Symbole, Service Worker ohne Zwischenspeicher, Push-Mitteilungen mit VAPID wie im Hub, Zahl am App-Symbol, Installationshinweis.
 Davor Phase 6: Startseite mit Kennzahlen, Kalender (Monat und Liste) mit Aufträgen und Fristen, Kalender-Abo fürs iPhone, Serien-Anlage, Sicherung außerhalb des Servers, Anleitung für Deployment und Wiederherstellung.

@@ -265,3 +265,7 @@ summary{cursor:pointer}
 @media (max-width:800px){.pf-layout{grid-template-columns:1fr}.pf-folders{flex-direction:row;overflow-x:auto;white-space:nowrap}
   .pf-boxes{flex-direction:row;border-bottom:0;border-right:1px solid var(--line);padding:0 6px 0 0;margin:0 4px 0 0}.pf-boxes a{word-break:normal}
   .pf-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"from date" "subj subj";gap:2px 10px}.pf-from{grid-area:from}.pf-subj{grid-area:subj;font-weight:inherit}.pf-date{grid-area:date}}
+
+/* Phase 10: Ausgaben */
+.tbl tr.summe td{border-top:2px solid var(--ink-3)}
+h2.zwischen{margin-top:16px}

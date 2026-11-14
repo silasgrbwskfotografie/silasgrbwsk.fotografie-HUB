@@ -26,6 +26,7 @@ import contextlib
 import csv
 import io
 import ipaddress
+import zipfile
 import getpass
 import hashlib
 import hmac
@@ -53,7 +54,7 @@ import webpush
 from postfach import PostfachError, imap_quote, pf_head, pf_name
 from webpush import b64u, b64u_dec, ec_pub_point, push_endpoint_ok
 
-VERSION = "0.10"
+VERSION = "0.11"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -276,6 +277,28 @@ TABLES = {
         "prioritaet": "TEXT DEFAULT 'Mittel'",
         "sort": "INTEGER DEFAULT 0",
     },
+    # ---- Phase 10: Ausgaben und Steuer-Vorbereitung (keine amtliche Buchhaltung) ----
+    "ausgaben": {
+        "datum": "TEXT",
+        "betrag_cent": "INTEGER",                        # Bruttobetrag; leer: Beleg unvollständig
+        "steuersatz": "INTEGER",                         # Prozent, zum Beispiel 19, 7 oder 0
+        "steuer_cent": "INTEGER",
+        "kategorie_id": "INTEGER REFERENCES ausgaben_kategorien(id)",
+        "lieferant": "TEXT",
+        "zahlart": "TEXT",
+        "anlagegut": "INTEGER DEFAULT 0",                # 1 = Kamera, Objektiv ...: Abschreibung legt die Steuerberatung fest
+        "auftrag_id": "INTEGER REFERENCES auftraege(id)",
+        "datei": "TEXT",
+        "datei_name": "TEXT",
+        "notiz": "TEXT",
+        "erstellt_am": "TEXT",
+        "geaendert_am": "TEXT",
+    },
+    "ausgaben_kategorien": {
+        "name": "TEXT NOT NULL",
+        "sort": "INTEGER DEFAULT 0",
+        "aktiv": "INTEGER DEFAULT 1",
+    },
     "push_abos": {                                       # angemeldetes Gerät
         "endpoint": "TEXT",                              # eindeutig über ux_push_endpoint
         "p256dh": "TEXT",
@@ -297,6 +320,7 @@ INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_mail_eingang_konto ON mail_eingang(konto_id, uid)",
     "CREATE INDEX IF NOT EXISTS ix_mail_verweise_mid ON mail_verweise(message_id)",
     "CREATE INDEX IF NOT EXISTS ix_termine_beginn ON termine(beginn)",
+    "CREATE INDEX IF NOT EXISTS ix_ausgaben_datum ON ausgaben(datum)",
     "CREATE INDEX IF NOT EXISTS ix_aufgaben_faellig ON aufgaben(faellig)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_push_endpoint ON push_abos(endpoint)",
 )
@@ -322,6 +346,8 @@ SEED_PAKETE = (
 # Standard-Aufgaben je Paket (Liste aus der Planung), mit Tagen relativ zum Auftrag
 SEED_AUFGABEN = (("Akkus laden", -1), ("Bilder sichern", 0), ("Auswahl bearbeiten", 1), ("Galerie hochladen", 3),
                  ("Link verschicken", 3), ("Zahlung prüfen", 7))
+# Kategorien als Vorlage (Liste aus der Planung), in den Einstellungen änderbar. Welche gelten, klärt Silas mit der Steuerberatung.
+SEED_KATEGORIEN = ("Ausrüstung", "Software und Abos", "Fahrtkosten", "Telefon und Internet", "Fortbildung", "Bürobedarf", "Sonstiges")
 WIEDERHOLUNGEN = ("", "täglich", "wöchentlich", "monatlich", "jährlich")
 PRIORITAETEN = ("Hoch", "Mittel", "Niedrig")
 STATUS_AUFGABE = ("Offen", "In Arbeit", "Erledigt")
@@ -365,6 +391,7 @@ def init_db():
                      "recovery TEXT, enabled_at TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS secrets (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS monats_sperren (monat TEXT PRIMARY KEY, gesperrt_am TEXT)")   # JJJJ-MM
         conn.execute("CREATE TABLE IF NOT EXISTS erinnerungen (schluessel TEXT PRIMARY KEY, zeit TEXT)")   # schon gesendete Push-Erinnerungen
         conn.execute("CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, user_id INTEGER, "
                      "user_name TEXT, action TEXT, table_name TEXT, record_id INTEGER, label TEXT, details TEXT)")
@@ -396,6 +423,11 @@ def seed(conn):
                              "VALUES (?, ?, ?, ?, '', 1, ?)",
                              (p["name"], p["grundpreis_cent"], p["inkl_spieler"], p["zusatzspieler_cent"], p["sort"]))
         conn.execute("INSERT INTO settings (key, value) VALUES ('seed_pakete', ?)", (now_iso(),))
+    if not conn.execute("SELECT 1 FROM settings WHERE key='seed_kategorien'").fetchone():
+        if not conn.execute("SELECT COUNT(*) FROM ausgaben_kategorien").fetchone()[0]:
+            for i, name in enumerate(SEED_KATEGORIEN, 1):
+                conn.execute("INSERT INTO ausgaben_kategorien (name, sort, aktiv) VALUES (?, ?, 1)", (name, i))
+        conn.execute("INSERT INTO settings (key, value) VALUES ('seed_kategorien', ?)", (now_iso(),))
     if not conn.execute("SELECT 1 FROM settings WHERE key='seed_aufgaben'").fetchone():
         # Liste aus der Planung, je Paket. Die Tage relativ zum Auftrag sind ein Vorschlag, in den Einstellungen änderbar.
         if not conn.execute("SELECT COUNT(*) FROM aufgaben_vorlagen").fetchone()[0]:
@@ -733,13 +765,14 @@ def twofa_reset(username):
 # Phase 2: Kunden, Kontakte, Pakete, Aufträge (allgemeine Tabellen-Schnittstelle wie api_table im Hub)
 # ---------------------------------------------------------------------------
 API_TABLES = ("kunden", "kontakte", "pakete", "auftraege", "zahlungen", "lieferlinks", "vorlagen", "vertraege", "dokumente",
-              "termine", "aufgaben", "aufgaben_vorlagen", "mailkonten", "mail_verweise")
+              "termine", "aufgaben", "aufgaben_vorlagen", "mailkonten", "mail_verweise", "ausgaben", "ausgaben_kategorien")
 ORDER = {"kunden": "name COLLATE NOCASE, id", "kontakte": "name COLLATE NOCASE, id", "pakete": "sort, id",
          "auftraege": "datum, uhrzeit, id", "zahlungen": "auftrag_id, art = 'Zahlung', id",
          "lieferlinks": "auftrag_id, erstellt_am, id", "vorlagen": "sort, id", "vertraege": "beginn, id",
          "dokumente": "hochgeladen_am DESC, id", "termine": "beginn, id",
          "aufgaben": "status = 'Erledigt', faellig = '', faellig IS NULL, faellig, prioritaet = 'Niedrig', prioritaet = 'Mittel', sort, id",
-         "aufgaben_vorlagen": "paket_id, sort, id", "mailkonten": "sort, id", "mail_verweise": "erstellt_am DESC, id"}
+         "aufgaben_vorlagen": "paket_id, sort, id", "mailkonten": "sort, id", "mail_verweise": "erstellt_am DESC, id",
+         "ausgaben": "datum IS NULL DESC, datum DESC, id DESC", "ausgaben_kategorien": "sort, id"}
 # Diese Felder setzt nur der Server (Preise, Fristen, Zeitstempel)
 SERVER_FIELDS = {
     "kunden": ("erstellt_am", "geaendert_am"),
@@ -751,6 +784,7 @@ SERVER_FIELDS = {
     "aufgaben": ("erstellt_am", "geaendert_am", "erledigt_am"),
     "termine": ("erstellt_am", "geaendert_am"),
     "mail_verweise": ("erstellt_am",),
+    "ausgaben": ("erstellt_am", "geaendert_am", "datei", "datei_name"),
     "auftraege": ("erstellt_am", "geaendert_am", "serie", "grundpreis_cent", "inkl_spieler", "zusatz_je_spieler_cent",
                   "anfahrt_frei_km", "anfahrt_cent_je_km", "zusatzspieler_cent", "anfahrt_cent", "lieferfrist"),
 }
@@ -883,6 +917,18 @@ def check_row(conn, table, row):
                 raise BadRequest("Ungültiger Port.")
         if (row.get("smtp_security") or "") not in ("", "ssl", "starttls"):
             raise BadRequest("Unbekannte Verschlüsselung.")
+    if table == "ausgaben":
+        if row.get("datum"):
+            try:
+                date.fromisoformat(row["datum"])
+            except ValueError:
+                raise BadRequest("Bitte ein gültiges Datum eingeben.")
+        if row.get("steuersatz") is not None and row["steuersatz"] > 100:
+            raise BadRequest("Steuersatz bitte in Prozent (0 bis 100).")
+        if row.get("zahlart") and row["zahlart"] not in ZAHLARTEN + ("Karte", "Lastschrift"):
+            raise BadRequest("Unbekannte Zahlart.")
+    if table == "ausgaben_kategorien" and not row.get("name"):
+        raise BadRequest("Bitte einen Namen eingeben.")
     if table == "mail_verweise" and (not row.get("konto_id") or not row.get("message_id")):
         raise BadRequest("Der Verweis braucht Konto und Message-ID.")
     if table in ("aufgaben", "aufgaben_vorlagen") and not row.get("titel"):
@@ -1057,7 +1103,7 @@ def mit_fristen(rows):
 
 
 # Uploads: nur erlaubte Dateitypen, am Inhalt geprüft, unter zufälligem Namen in data/uploads, nie öffentlich
-DATEI_TABELLEN = {"vertraege": ("pdf",), "dokumente": ("pdf",)}
+DATEI_TABELLEN = {"vertraege": ("pdf",), "dokumente": ("pdf",), "ausgaben": ("pdf", "jpg", "png")}
 DATEI_ARTEN = {"pdf": (b"%PDF-", ".pdf", "application/pdf"), "jpg": (b"\xff\xd8\xff", ".jpg", "image/jpeg"),
                "png": (b"\x89PNG\r\n\x1a\n", ".png", "image/png")}
 DATEI_MAX = 15 * 1024 * 1024
@@ -1501,6 +1547,119 @@ def kunde_zur_adresse(conn, absender):
     return row_dict(r) if r else None
 
 
+# ---------------------------------------------------------------------------
+# Phase 10: Ausgaben, Übersicht im Aufbau einer EÜR, Monatssperre, Export. Vorbereitung für Finom und die Steuerberatung,
+# ausdrücklich keine amtliche Buchhaltung und keine Abgabe ans Finanzamt.
+# ---------------------------------------------------------------------------
+def monat_gesperrt(conn, iso_datum):
+    return bool(iso_datum) and bool(conn.execute("SELECT 1 FROM monats_sperren WHERE monat=?", (str(iso_datum)[:7],)).fetchone())
+
+
+def sperre_betroffen(table, r):
+    """Datum, das für die Sperre zählt: Ausgaben nach Belegdatum, Einnahmen nach Zahldatum (nur bezahlte)."""
+    if not r:
+        return None
+    if table == "ausgaben":
+        return r.get("datum") if isinstance(r, dict) else r["datum"]
+    if table == "zahlungen":
+        d = r if isinstance(r, dict) else row_dict(r)
+        return d.get("zahldatum") if d.get("status") == "Bezahlt" else None
+    return None
+
+
+def sperre_pruefen(conn, table, old, row, data):
+    """Änderungen in gesperrten Monaten nur mit Grund. Rückgabe: der Grund (für das Protokoll) oder ""."""
+    if table not in ("ausgaben", "zahlungen"):
+        return ""
+    betroffen = [d for d in (sperre_betroffen(table, old), sperre_betroffen(table, row)) if d and monat_gesperrt(conn, d)]
+    if not betroffen:
+        return ""
+    if old is not None and row is not None and table == "zahlungen":
+        # reine Finom-Häkchen und Notizen ändern nichts an den Zahlen
+        kern = ("betrag_cent", "status", "zahldatum")
+        if all(str(old[k] if old[k] is not None else "") == str(row.get(k) if row.get(k) is not None else "") for k in kern):
+            return ""
+    grund = str((data or {}).get("sperr_grund") or "").strip()[:300]
+    if not grund:
+        d = betroffen[0]
+        raise BadRequest(f"Der Monat {d[5:7]}.{d[:4]} ist gesperrt. "
+                         "Änderungen nur mit Grund, er steht dann im Protokoll.")
+    return grund
+
+
+def euer(conn, jahr):
+    """Übersicht im Aufbau einer EÜR je Monat (Cent). Einnahmen: bezahlte Zahlungen nach Zahldatum. Ausgaben nach Belegdatum,
+    Anlagegüter getrennt, weil die Abschreibung die Steuerberatung festlegt. Ergebnis = Einnahmen minus Ausgaben ohne Anlagegüter."""
+    j = str(jahr)
+    ein = [0] * 12
+    for r in conn.execute("SELECT zahldatum, betrag_cent FROM zahlungen WHERE status='Bezahlt' AND substr(zahldatum, 1, 4)=?", (j,)):
+        ein[int(r["zahldatum"][5:7]) - 1] += r["betrag_cent"] or 0
+    aus, anlage, kat = [0] * 12, [0] * 12, {}
+    namen = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM ausgaben_kategorien")}
+    for r in conn.execute("SELECT datum, betrag_cent, kategorie_id, anlagegut FROM ausgaben WHERE substr(datum, 1, 4)=? AND betrag_cent IS NOT NULL", (j,)):
+        mo = int(r["datum"][5:7]) - 1
+        if r["anlagegut"]:
+            anlage[mo] += r["betrag_cent"]
+            continue
+        aus[mo] += r["betrag_cent"]
+        name = namen.get(r["kategorie_id"], "ohne Kategorie")
+        kat.setdefault(name, [0] * 12)[mo] += r["betrag_cent"]
+    gesperrt = {r[0] for r in conn.execute("SELECT monat FROM monats_sperren WHERE monat LIKE ?", (j + "-%",))}
+    return {"jahr": int(jahr), "einnahmen": ein, "ausgaben": aus, "anlagegueter": anlage, "ergebnis": [e - a for e, a in zip(ein, aus)],
+            "kategorien": sorted(([k, v, sum(v)] for k, v in kat.items()), key=lambda x: -x[2]),
+            "summe": {"einnahmen": sum(ein), "ausgaben": sum(aus), "anlagegueter": sum(anlage), "ergebnis": sum(ein) - sum(aus)},
+            "gesperrt": sorted(gesperrt),
+            "unvollstaendig": conn.execute("SELECT COUNT(*) FROM ausgaben WHERE IFNULL(datum, '')='' OR betrag_cent IS NULL").fetchone()[0]}
+
+
+def betrag_csv(cent):
+    return "" if cent is None else eur_text(cent).replace(" €", "").replace(".", "")
+
+
+def csv_text(kopf, zeilen):
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
+    w.writerow(kopf)
+    for z in zeilen:
+        w.writerow([csv_zelle(x) for x in z])
+    return "﻿" + buf.getvalue()
+
+
+def export_einnahmen(conn, von, bis):
+    rows = conn.execute("SELECT z.*, a.begegnung, a.datum, k.name AS kunde, c.name AS zahler FROM zahlungen z JOIN auftraege a ON a.id = z.auftrag_id "
+                        "LEFT JOIN kunden k ON k.id = a.kunde_id LEFT JOIN kontakte c ON c.id = z.zahler_id "
+                        "WHERE z.status='Bezahlt' AND z.zahldatum >= ? AND z.zahldatum <= ? ORDER BY z.zahldatum, z.id", (von, bis))
+    return csv_text(["Zahldatum", "Kunde", "Auftrag", "Datum Auftrag", "Art", "Zahler", "Zahlart", "Betrag", "Finom-Rechnung"],
+                    [(datum_text(r["zahldatum"]), r["kunde"], r["begegnung"], datum_text(r["datum"]), r["art"], r["zahler"], r["zahlart"],
+                      betrag_csv(r["betrag_cent"]), r["finom_rechnungsnr"]) for r in rows])
+
+
+def beleg_name(r):
+    """Verständlicher Dateiname im ZIP: 2026-11-03_Lieferant_12,34_ID.pdf"""
+    teil = re.sub(r"[^\w.,-]+", "-", (r["lieferant"] or "ohne-Lieferant"), flags=re.U).strip("-")[:40] or "Beleg"
+    endung = Path(r["datei"]).suffix
+    return f"{r['datum'] or 'ohne-Datum'}_{teil}_{betrag_csv(r['betrag_cent']) or 'ohne-Betrag'}_{r['id']}{endung}"
+
+
+def export_ausgaben(conn, von, bis):
+    namen = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM ausgaben_kategorien")}
+    rows = conn.execute("SELECT * FROM ausgaben WHERE datum >= ? AND datum <= ? ORDER BY datum, id", (von, bis))
+    return csv_text(["Datum", "Lieferant", "Kategorie", "Betrag brutto", "Steuersatz %", "Steuerbetrag", "Zahlart", "Anlagegut", "Auftrag", "Notiz", "Beleg"],
+                    [(datum_text(r["datum"]), r["lieferant"], namen.get(r["kategorie_id"], ""), betrag_csv(r["betrag_cent"]),
+                      "" if r["steuersatz"] is None else r["steuersatz"], betrag_csv(r["steuer_cent"]), r["zahlart"], "ja" if r["anlagegut"] else "",
+                      r["auftrag_id"] or "", r["notiz"], beleg_name(r) if r["datei"] else "") for r in rows])
+
+
+def export_belege_zip(conn, von, bis):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for r in conn.execute("SELECT * FROM ausgaben WHERE datum >= ? AND datum <= ? AND IFNULL(datei, '') != '' ORDER BY datum, id", (von, bis)):
+            pfad = UPLOADS / r["datei"]
+            if pfad.is_file():
+                z.write(pfad, beleg_name(r))
+    return buf.getvalue()
+
+
 def audit_label(table, r):
     if table == "auftraege":
         return f"{datum_text(r['datum'])} {r['begegnung'] or ''}".strip()
@@ -1512,6 +1671,8 @@ def audit_label(table, r):
         return r["adresse"] or ""
     if table == "mail_verweise":
         return r["betreff"] or r["message_id"] or ""
+    if table == "ausgaben":
+        return f"{datum_text(r['datum'])} {r['lieferant'] or ''} {eur_text(r['betrag_cent']) if r['betrag_cent'] is not None else ''}".strip()
     if table == "vertraege":
         return f"{r['art']} ab {datum_text(r['beginn'])}"
     keys = r.keys()
@@ -1538,6 +1699,7 @@ def speichern(conn, table, data, old, user, fest=None):
                 vals[k] = d
     row = {**(row_dict(old) if old else {}), **vals}
     check_row(conn, table, row)
+    grund = sperre_pruefen(conn, table, old, row, data)
     if table == "auftraege":
         pr = auftrag_preise(conn, row, old)
         pr.pop("berechnet_cent")
@@ -1581,6 +1743,8 @@ def speichern(conn, table, data, old, user, fest=None):
             audit(conn, user, "geändert", "auftraege", a["id"], audit_label("auftraege", a),
                   {"status": [a["status"], "Geliefert"], "Grund": "Galerie-Link eingetragen"})
     r = conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone()
+    if changes and grund:
+        changes["Grund (gesperrter Monat)"] = grund
     if changes:
         audit(conn, user, "geändert" if old else "neu", table, rid, audit_label(table, r), changes)
     out = row_dict(r)
@@ -2377,6 +2541,36 @@ class Handler(BaseHTTPRequestHandler):
                     set_setting(conn, "ics_token_hash", "")
                     audit(conn, user, "Kalender-Abo abgeschaltet", "settings", None, "Kalender-Abo")
                 return self.send_json({"aktiv": bool(get_setting(conn, "ics_token_hash"))})
+        if method == "GET" and head == "euer" and not p[1:]:
+            q = parse_qs(urlparse(self.path).query)
+            jahr = (q.get("jahr") or [""])[0]
+            with db() as conn:
+                return self.send_json(euer(conn, int(jahr) if re.fullmatch(r"20[0-9]{2}", jahr) else int(heute()[:4])))
+        if head == "sperren":
+            return self.api_sperren(method, p[1:], user)
+        if method == "GET" and head == "export" and len(p) == 2 and p[1] in ("einnahmen.csv", "ausgaben.csv", "belege.zip"):
+            q = parse_qs(urlparse(self.path).query)
+            von, bis = (q.get("von") or [""])[0], (q.get("bis") or [""])[0]
+            try:
+                if date.fromisoformat(bis) < date.fromisoformat(von):
+                    raise ValueError
+            except ValueError:
+                raise BadRequest("Zeitraum bitte als von und bis (JJJJ-MM-TT).")
+            with db() as conn:
+                if p[1] == "belege.zip":
+                    body, ctype = export_belege_zip(conn, von, bis), "application/zip"
+                else:
+                    body = (export_einnahmen if p[1] == "einnahmen.csv" else export_ausgaben)(conn, von, bis).encode("utf-8")
+                    ctype = "text/csv; charset=utf-8"
+                audit(conn, user, "Export", "", None, p[1], {"von": von, "bis": bis})
+            name = f"{p[1].split('.')[0]}_{von}_bis_{bis}.{p[1].split('.')[1]}"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return self.wfile.write(body)
         if head == "postfach":
             return self.api_postfach(method, p[1:], user)
         if head == "mailkonten" and len(p) == 3 and re.fullmatch(r"[0-9]{1,9}", p[1]) and p[2] in ("passwort", "pruefen"):
@@ -2450,6 +2644,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(out, 200 if old else 201)
 
             if method == "DELETE" and old:
+                grund = sperre_pruefen(conn, table, old, None, {"sperr_grund": parse_qs(urlparse(self.path).query).get("grund", [""])[0]})
                 # Endgültig löschen geht nur, wenn nichts daran hängt: sonst meldet die Datenbank einen Fehler
                 # (IntegrityError, siehe handle_request) und alles wird zurückgerollt.
                 if table == "kunden":
@@ -2483,9 +2678,29 @@ class Handler(BaseHTTPRequestHandler):
                 if table in DATEI_TABELLEN:
                     datei_loeschen(old["datei"])
                 audit(conn, user, "gelöscht", table, rid, audit_label(table, old),
-                      {k: v for k, v in row_dict(old).items() if k not in AUDIT_SKIP and v not in (None, "")})
+                      {**{k: v for k, v in row_dict(old).items() if k not in AUDIT_SKIP and v not in (None, "")},
+                       **({"Grund (gesperrter Monat)": grund} if grund else {})})
                 return self.send_json({"ok": True})
         return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+
+    # -- Monatssperre (/api/sperren[/JJJJ-MM]) -----------------------------
+    def api_sperren(self, method, p, user):
+        with db() as conn:
+            if method == "POST" and not p:
+                monat = str(self.read_json().get("monat") or "")
+                if not re.fullmatch(r"20[0-9]{2}-(0[1-9]|1[0-2])", monat):
+                    raise BadRequest("Monat bitte als JJJJ-MM.")
+                conn.execute("INSERT OR IGNORE INTO monats_sperren (monat, gesperrt_am) VALUES (?, ?)", (monat, now_iso()))
+                audit(conn, user, "Monat gesperrt", "monats_sperren", None, monat)
+            elif method == "DELETE" and len(p) == 1 and re.fullmatch(r"20[0-9]{2}-[0-9]{2}", p[0]):
+                grund = (parse_qs(urlparse(self.path).query).get("grund") or [""])[0].strip()[:300]
+                if not grund:
+                    raise BadRequest("Entsperren nur mit Grund, er steht im Protokoll.")
+                conn.execute("DELETE FROM monats_sperren WHERE monat=?", (p[0],))
+                audit(conn, user, "Monat entsperrt", "monats_sperren", None, p[0], {"Grund": grund})
+            elif method != "GET" or p:
+                return self.send_json({"error": "Unbekannte Schnittstelle"}, 404)
+            return self.send_json([row_dict(r) for r in conn.execute("SELECT * FROM monats_sperren ORDER BY monat DESC")])
 
     # -- Mailkonto: Passwort setzen, Verbindung prüfen ---------------------
     def api_mailkonto(self, method, kid, was, user):
@@ -2837,12 +3052,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error": "Diesen Eintrag gibt es nicht."}, 404)
             if method == "POST":
                 data = self.read_json(limit=DATEI_MAX * 4 // 3 + 4096)
+                grund = sperre_pruefen(conn, table, r, row_dict(r), data) if table == "ausgaben" else ""
                 fname, anzeige, groesse = datei_speichern(data.get("data"), data.get("name"), DATEI_TABELLEN[table])
                 vals = {"datei": fname, "datei_name": anzeige}
                 if table == "dokumente":
                     vals.update(groesse=groesse, hochgeladen_am=now_iso())
                 conn.execute(f"UPDATE {table} SET {', '.join(k + '=?' for k in vals)} WHERE id=?", [*vals.values(), rid])
-                audit(conn, user, "Datei hochgeladen", table, rid, anzeige, {"Größe": groesse})
+                audit(conn, user, "Datei hochgeladen", table, rid, anzeige, {"Größe": groesse, **({"Grund (gesperrter Monat)": grund} if grund else {})})
                 alt = r["datei"]
                 out = row_dict(conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone())
             elif method == "GET":

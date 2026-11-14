@@ -45,7 +45,7 @@ function toast(msg) {
 const TITLES = {
   start: 'Start', auftraege: 'Aufträge und Spiele', kunden: 'Kunden', zahlungen: 'Zahlungen', lieferung: 'Bildauslieferung',
   vertraege: 'Verträge und Dokumente', mail: 'Mail', kalender: 'Kalender', aufgaben: 'Aufgaben', einstellungen: 'Einstellungen',
-  sicherheit: 'Sicherheit', auftrag: 'Auftrag', protokoll: 'Protokoll',
+  sicherheit: 'Sicherheit', auftrag: 'Auftrag', protokoll: 'Protokoll', ausgaben: 'Ausgaben und Steuer',
 };
 const ICONS = {
   start: '<path d="M3 11l9-8 9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/>',
