@@ -93,7 +93,6 @@ function head(title, sub) {
 /* Seiten, die in späteren Phasen gebaut werden */
 const LATER = {
   mail: [9, 'Postfach wie im Emden Tigers Hub, mit mehreren Konten.'],
-  kalender: [6, 'Kalenderansicht und ICS-Abo, eigene Termine ab Phase 8.'],
   aufgaben: [8, 'Aufgaben mit Fälligkeit, Vorlagen je Paket und Erinnerungen.'],
 };
 Object.entries(LATER).forEach(([key, [phase, text]]) => {
@@ -102,28 +101,6 @@ Object.entries(LATER).forEach(([key, [phase, text]]) => {
       <p class="muted small">Dieser Bereich wird in Phase ${phase} gebaut.</p></div>`;
   };
 });
-
-App.pages.start = async (view) => {
-  const [pakete, s] = await Promise.all([api('pakete'), api('einstellungen')]);
-  const heute = new Date();
-  const iso = `${heute.getFullYear()}-${String(heute.getMonth() + 1).padStart(2, '0')}-${String(heute.getDate()).padStart(2, '0')}`;
-  view.innerHTML = head('Hallo ' + (App.me.display_name || App.me.username), 'Heute ist der ' + datum(iso))
-    + `<div class="grid g2">
-      <div class="card"><h2>Stand</h2>
-        <p>Phase 5 ist eingerichtet: Kunden, Aufträge, Zahlungen, Bildauslieferung, Verträge und Dokumente.</p>
-        <p class="muted small">Termine, Lieferungen, offene Zahlungen und Umsatz erscheinen hier ab Phase 6.</p></div>
-      <div class="card"><h2>Pakete</h2>${paketTabelle(pakete)}
-        <p class="muted small">Anfahrt: ${esc(s.anfahrt_frei_km)} km frei, danach ${euro(s.anfahrt_cent_je_km)} je km.</p></div>
-    </div>`;
-};
-
-function paketTabelle(pakete) {
-  if (!pakete.length) return '<p class="muted">Noch keine Pakete.</p>';
-  return `<table class="tbl"><thead><tr><th>Paket</th><th class="num">Preis</th><th>Zusatz</th></tr></thead><tbody>`
-    + pakete.map(p => `<tr${p.aktiv ? '' : ' class="muted"'}><td>${esc(p.name)}</td><td class="num">${euro(p.grundpreis_cent)}</td>
-      <td class="small">${p.inkl_spieler ? `bis ${p.inkl_spieler} Spieler, jeder weitere ${euro(p.zusatzspieler_cent)}` : ''}</td></tr>`).join('')
-    + '</tbody></table>';
-}
 
 /* ---------- Sicherheit: Zwei-Faktor-Anmeldung (wie im Hub) ---------- */
 App.pages.sicherheit = async (view) => {

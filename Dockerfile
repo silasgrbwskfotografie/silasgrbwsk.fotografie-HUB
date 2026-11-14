@@ -13,7 +13,7 @@ RUN apt-get update \
  && mkdir -p /data && chown studio /data
 
 WORKDIR /app
-COPY --chown=studio server.py ./
+COPY --chown=studio *.py ./
 COPY --chown=studio static ./static
 
 USER studio

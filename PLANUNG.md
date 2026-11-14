@@ -211,6 +211,7 @@ Regeln für die Umsetzung:
 - Phase 4: Lieferfrist-Ampel rot = Frist vorbei, gelb = Spiel war und Frist läuft, grün = geliefert. Galerie-Links nur mit https://.
 - Phase 5: Vertragsende = festes Ende oder Beginn plus Mindestlaufzeit minus 1 Tag. "Spätestens kündigen bis" = Ende minus Frist (Monate zum Monatsende abgeschnitten). Verlängert sich der Vertrag und ist die Frist vorbei, zählt die nächste Periode. Uploads nur PDF bis 15 MB, am Inhalt geprüft.
 - Entschieden am 14.11.2026: Alle weiteren Phasen am Stück, Commit nach jeder Phase. Kalender liest zusätzlich einen fremden ICS-Link ein. Fahrtenbuch-Karte mit OpenStreetMap-Kacheln. Aufgaben-Vorlagen je Paket aus der Liste dieser Planung.
+- Phase 6: Kalender als eigene einfache Ansicht statt FullCalendar (keine fremde Bibliothek nötig). Kalender-Abo über einen geheimen Link, gespeichert wird nur sein Hash, er wird nur beim Erstellen angezeigt. Deployment auf den VPS macht Silas nach der Anleitung im README.
 
 ## Technik und Architektur
 

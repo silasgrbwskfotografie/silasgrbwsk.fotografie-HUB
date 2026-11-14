@@ -54,7 +54,8 @@ function readForm(form, fields) {
 }
 
 /* Dialog zum Anlegen und Bearbeiten. opts: fix (feste Werte), extra (HTML unter den Feldern), bind(form),
-   danach(was, gespeichert) statt Neuzeichnen der Seite. was: 'save' | 'arch' | 'del'. ohneLoeschen: kein Löschknopf */
+   danach(was, gespeichert) statt Neuzeichnen der Seite. was: 'save' | 'arch' | 'del'. ohneLoeschen: kein Löschknopf.
+   umwandeln(daten): Daten vor dem Senden umbauen, ein Fehler erscheint als Meldung */
 function editRecord(table, title, fields, rec = {}, opts = {}) {
   const dlg = $('#modal');
   const archivierbar = rec.id && 'archiviert' in rec;
@@ -71,7 +72,9 @@ function editRecord(table, title, fields, rec = {}, opts = {}) {
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     try {
-      const r = await api(url, rec.id ? 'PUT' : 'POST', { ...readForm(form, fields), ...(opts.fix || {}) });
+      let body = { ...readForm(form, fields), ...(opts.fix || {}) };
+      if (opts.umwandeln) body = opts.umwandeln(body);
+      const r = await api(url, rec.id ? 'PUT' : 'POST', body);
       try {
         for (const f of fields.filter(x => x.type === 'file')) {
           const file = form.elements[f.key].files[0];
@@ -206,7 +209,7 @@ function auftragDialog(a, d, opts = {}) {
 App.pages.auftraege = async (view) => {
   const [auftraege, kunden, pakete] = await Promise.all([api('auftraege'), api('kunden'), api('pakete')]);
   view.innerHTML = head('Aufträge und Spiele')
-    + `<div class="toolbar"><button class="btn primary" id="aNeu">Auftrag anlegen</button>
+    + `<div class="toolbar"><button class="btn primary" id="aNeu">Auftrag anlegen</button><button class="btn" id="aSerie">Serie anlegen</button>
       <select class="input" id="aKunde" aria-label="Kunde"><option value="">Alle Kunden</option>${kunden.map(k => `<option value="${k.id}"${String(k.id) === Filter.aKunde ? ' selected' : ''}>${esc(k.name)}</option>`).join('')}</select>
       <select class="input" id="aStatus" aria-label="Status"><option value="">Jeder Status</option>${STATUS_AUFTRAG.map(x => `<option${x === Filter.aStatus ? ' selected' : ''}>${x}</option>`).join('')}</select>
       <label class="check">von <input class="input" type="date" id="aVon" value="${esc(Filter.aVon)}"></label>
@@ -235,6 +238,7 @@ App.pages.auftraege = async (view) => {
   draw();
   $('#aNeu').addEventListener('click', () => auftragDialog({}, { auftraege, kunden, pakete },
     { danach: (was, r) => { location.hash = '#/auftrag/' + r.id; } }));
+  $('#aSerie').addEventListener('click', () => serieDialog(kunden, pakete, auftraege));
   ['aKunde', 'aStatus', 'aVon', 'aBis'].forEach(key =>
     $('#' + key).addEventListener('change', (ev) => { Filter[key] = ev.target.value; draw(); }));
   $('#aArchiv').addEventListener('change', (ev) => { Filter.aArchiv = ev.target.checked; draw(); });
@@ -654,4 +658,154 @@ App.pages.vertraege = async (view) => {
     const id = ev.target.closest('button')?.dataset.dok;
     if (id) { const d = byId(dokumente, id); editRecord('dokumente', 'Dokument bearbeiten', dokFelder(d), { ...d, datei: d.datei_name }); }
   });
+};
+
+/* ---------- Serie: mehrere Spieltage eines Kunden auf einmal ---------- */
+/* Eine Zeile je Termin: "TT.MM.JJJJ HH:MM Begegnung", Uhrzeit und Begegnung sind freiwillig */
+function serieZeilen(text) {
+  const zeilen = String(text || '').split('\n').map(z => z.trim()).filter(Boolean);
+  if (!zeilen.length) throw new Error('Bitte mindestens einen Termin eintragen.');
+  return zeilen.map((z, i) => {
+    const m = /^(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})(?:\s+(\d{1,2}):(\d{2}))?(?:\s+(.*))?$/.exec(z);
+    if (!m) throw new Error(`Zeile ${i + 1}: bitte als TT.MM.JJJJ, optional mit Uhrzeit und Begegnung.`);
+    const jahr = m[3].length === 2 ? '20' + m[3] : m[3];
+    return { datum: `${jahr}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`, uhrzeit: m[4] ? `${m[4].padStart(2, '0')}:${m[5]}` : '',
+      begegnung: (m[6] || '').trim() };
+  });
+}
+
+function serieDialog(kunden, pakete, auftraege) {
+  const sportarten = [...new Set(auftraege.map(x => x.sportart).filter(Boolean))].sort();
+  const felder = [
+    { key: 'kunde_id', label: 'Kunde', type: 'select', required: true, options: [['', 'bitte wählen']].concat(kunden.filter(k => !k.archiviert).map(k => [k.id, k.name])) },
+    { key: 'paket_id', label: 'Paket', type: 'select', required: true, options: [['', 'bitte wählen']].concat(pakete.filter(p => p.aktiv).map(p => [p.id, `${p.name} (${euro(p.grundpreis_cent)})`])) },
+    { key: 'ort', label: 'Ort (für alle gleich)' },
+    { key: 'sportart', label: 'Sportart', list: sportarten },
+    { key: 'km', label: 'Kilometer, einfache Strecke ab Emden', type: 'number' },
+    { key: 'status', label: 'Status', type: 'select', options: STATUS_AUFTRAG.map(x => [x, x]), def: 'Bestätigt' },
+    { key: 'termine_text', label: 'Termine, einer je Zeile: TT.MM.JJJJ HH:MM Begegnung', type: 'textarea', full: true, required: true },
+  ];
+  editRecord('auftraege/serie', 'Serie anlegen', felder, {}, {
+    extra: '<p class="muted small">Beispiel: <code>07.03.2027 19:30 HSG Emden gegen TuS</code>. Jeder Termin wird ein eigener Auftrag mit eigener Zahlung.</p>',
+    umwandeln: (d) => { const { termine_text: t, ...rest } = d; return { ...rest, termine: serieZeilen(t) }; },
+    danach: (was, r) => { toast(`${r.length} Aufträge angelegt`); router(); },
+  });
+}
+
+/* ---------- Datum ---------- */
+const isoTag = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const WOCHENTAGE = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'];
+const MONATSNAMEN = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
+
+/* ---------- Startseite ---------- */
+App.pages.start = async (view) => {
+  const d = await api('dashboard');
+  const liste = (rows, zeile, leer) => rows.length ? `<table class="tbl"><tbody>${rows.map(zeile).join('')}</tbody></table>` : `<p class="muted">${leer}</p>`;
+  const auftragLink = a => `<a class="linkbtn" href="#/auftrag/${a.auftrag_id || a.id}"><b>${esc(a.begegnung || 'ohne Titel')}</b></a>`;
+  const anteil = d.umsatz_grenze ? Math.round(d.umsatz_jahr / d.umsatz_grenze * 100) : null;
+  view.innerHTML = head('Hallo ' + (App.me.display_name || App.me.username), 'Heute ist der ' + datum(d.heute))
+    + `<div class="grid g2">
+      <div class="card"><h2>Nächste 14 Tage</h2>${liste(d.termine, a => `<tr><td class="nowrap">${ampelPunkt(a)}${datum(a.datum)}${a.uhrzeit ? `<br><span class="muted small">${esc(a.uhrzeit)} Uhr</span>` : ''}</td>
+        <td>${auftragLink(a)}<br><span class="muted small">${esc([a.kunde, a.ort].filter(Boolean).join(' · '))}</span></td><td>${esc(a.status)}</td></tr>`, 'Keine Termine in den nächsten 14 Tagen.')}</div>
+      <div class="card"><h2>Überfällige Lieferungen</h2>${liste(d.ueberfaellig, a => `<tr><td class="nowrap">${ampelPunkt(a)}${datum(a.datum)}</td>
+        <td>${auftragLink(a)}<br><span class="muted small">${esc(a.kunde)}</span></td><td class="num">Frist ${datum(a.lieferfrist)}</td></tr>`, 'Nichts überfällig.')}</div>
+      <div class="card"><h2>Offene Zahlungen: ${euro(d.offen_summe)}</h2>${liste(d.offen.slice(0, 6), z => `<tr><td class="nowrap">${datum(z.datum)}</td>
+        <td>${auftragLink(z)}<br><span class="muted small">${esc(z.kunde || '')}${z.art === 'Anzahlung' ? ' · Anzahlung' : ''}</span></td><td class="num">${euro(z.betrag_cent)}</td></tr>`, 'Keine offenen Zahlungen.')}
+        ${d.offen.length > 6 ? `<a class="small" href="#/zahlungen">Alle ${d.offen.length} offenen Zahlungen</a>` : ''}</div>
+      <div class="card"><h2>Umsatz ${d.jahr}</h2><p class="gross">${euro(d.umsatz_jahr)}</p>
+        ${anteil === null ? '<p class="muted small">Umsatzgrenze noch nicht festgelegt.</p>' : `<div class="balken${anteil >= 80 ? ' warn' : ''}"><span></span></div>
+        <p class="muted small">${anteil} % der Grenze von ${euro(d.umsatz_grenze)}</p>`}</div>
+      <div class="card"><h2>Links laufen in 7 Tagen ab</h2>${liste(d.links_ablauf, l => `<tr><td>${auftragLink(l)}<br><span class="muted small">${esc(l.kunde)} · ${esc(l.typ)}</span></td>
+        <td class="num">${ablaufText(l.laeuft_ab_am)}</td></tr>`, 'Kein Link läuft bald ab.')}</div>
+      <div class="card"><h2>Vertragsfristen (60 Tage)</h2>${liste(d.vertraege, v => `<tr><td><a class="linkbtn" href="#/vertraege"><b>${esc(v.kunde || '')}</b></a><br>
+        <span class="muted small">${esc(v.art)}</span></td><td class="num">${fristBadge(v)}</td></tr>`, 'Keine Kündigungsfrist in den nächsten 60 Tagen.')}</div>
+    </div>`;
+  $$('.balken span', view).forEach(el => { el.style.width = Math.min(100, anteil) + '%'; });
+};
+
+/* ---------- Kalender ---------- */
+const KAL_ARTEN = { auftrag: 'Aufträge', lieferfrist: 'Lieferfristen', vertrag: 'Vertragsfristen', ablauf: 'Link-Abläufe' };
+const kalLink = e => e.art === 'vertrag' ? '#/vertraege' : e.art === 'aufgabe' ? '#/aufgaben' : e.art === 'termin' ? `#/kalender/termin/${e.id}`
+  : e.art === 'extern' ? '' : `#/auftrag/${e.id}`;
+function kalChip(e) {
+  const txt = `${e.uhrzeit ? esc(e.uhrzeit) + ' ' : ''}${esc(e.titel)}`;
+  const href = kalLink(e);
+  return href ? `<a class="kal-chip ${e.art}${e.status === 'Abgesagt' ? ' abgesagt' : ''}" href="${href}">${txt}</a>` : `<span class="kal-chip ${e.art}">${txt}</span>`;
+}
+
+App.pages.kalender = async (view, ...rest) => {
+  if (rest[0] === 'termin' && App.terminDialog) return App.terminDialog(view, rest[1]);
+  if (!Filter.kArten) Filter.kArten = Object.keys(KAL_ARTEN);
+  if (!Filter.kAnsicht) Filter.kAnsicht = matchMedia('(max-width: 700px)').matches ? 'agenda' : 'monat';
+  const monat = Filter.kMonat || isoTag(new Date()).slice(0, 7);
+  const [y, mo] = monat.split('-').map(Number);
+  const erster = new Date(y, mo - 1, 1), letzter = new Date(y, mo, 0);
+  const start = new Date(y, mo - 1, 1 - (erster.getDay() + 6) % 7);
+  const ende = new Date(y, mo - 1, letzter.getDate() + 6 - (letzter.getDay() + 6) % 7);
+  const [alle, abo] = await Promise.all([api(`kalender?von=${isoTag(start)}&bis=${isoTag(ende)}`), api('kalender/abo')]);
+  const eintraege = alle.filter(e => Filter.kArten.includes(e.art) || !(e.art in KAL_ARTEN));
+  const amTag = {};
+  eintraege.forEach(e => (amTag[e.datum] = amTag[e.datum] || []).push(e));
+  const heute = isoTag(new Date());
+
+  let inhalt;
+  if (Filter.kAnsicht === 'monat') {
+    let zellen = '';
+    for (let d = new Date(start); d <= ende; d.setDate(d.getDate() + 1)) {
+      const t = isoTag(d);
+      zellen += `<div class="kal-tag${d.getMonth() !== mo - 1 ? ' fremd' : ''}${t === heute ? ' heute' : ''}"><span class="kal-nr">${d.getDate()}</span>
+        ${(amTag[t] || []).map(kalChip).join('')}</div>`;
+    }
+    inhalt = `<div class="kal-monat">${WOCHENTAGE.map(w => `<div class="kal-kopf">${w}</div>`).join('')}${zellen}</div>`;
+  } else {
+    const tage = Object.keys(amTag).filter(t => t.slice(0, 7) === monat).sort();
+    inhalt = tage.length ? tage.map(t => { const d = new Date(t + 'T12:00'); return `<div class="kal-agenda${t === heute ? ' heute' : ''}">
+      <div class="kal-datum"><b>${WOCHENTAGE[(d.getDay() + 6) % 7]}, ${datum(t)}</b></div>${amTag[t].map(kalChip).join('')}</div>`; }).join('')
+      : '<p class="muted">In diesem Monat steht nichts an.</p>';
+  }
+
+  view.innerHTML = head('Kalender', `${MONATSNAMEN[mo - 1]} ${y}`)
+    + `<div class="toolbar"><button class="btn sm" data-monat="-1" aria-label="Voriger Monat">‹</button><button class="btn sm" data-monat="0">Heute</button>
+      <button class="btn sm" data-monat="1" aria-label="Nächster Monat">›</button>
+      <select class="input sm" id="kAnsicht" aria-label="Ansicht"><option value="monat"${Filter.kAnsicht === 'monat' ? ' selected' : ''}>Monat</option>
+        <option value="agenda"${Filter.kAnsicht === 'agenda' ? ' selected' : ''}>Liste</option></select>
+      ${Object.entries(KAL_ARTEN).map(([k, t]) => `<label class="check"><input type="checkbox" data-art="${k}"${Filter.kArten.includes(k) ? ' checked' : ''}> <span class="kal-chip ${k}">${t}</span></label>`).join('')}
+      <span id="kalExtra"></span></div>
+    <div class="card" id="kalInhalt">${inhalt}</div>
+    <div class="card" id="aboCard"><h2>Kalender-Abo fürs iPhone</h2>
+      <p class="muted small">Ein geheimer Link, den der iPhone-Kalender regelmäßig abruft: Einstellungen, Kalender, Accounts, Account hinzufügen, Andere,
+        Kalenderabo hinzufügen. Er zeigt nur Termin, Ort und Begegnung, keine Beträge und keine Kontaktdaten. Das klappt erst, wenn das Tool auf dem Server läuft.</p>
+      <p>${abo.aktiv ? '<span class="badge ok">eingerichtet</span>' : '<span class="badge plain">nicht eingerichtet</span>'}</p>
+      <div id="aboLink"></div>
+      <div class="btn-row"><button type="button" class="btn sm" id="aboNeu">${abo.aktiv ? 'Neuen Link erstellen (alter gilt dann nicht mehr)' : 'Link erstellen'}</button>
+        ${abo.aktiv ? '<button type="button" class="btn sm danger" id="aboAus">Abschalten</button>' : ''}</div></div>`;
+
+  $('.toolbar', view).addEventListener('click', (ev) => {
+    const m = ev.target.closest('button')?.dataset.monat;
+    if (m === undefined) return;
+    const d = m === '0' ? new Date() : new Date(y, mo - 1 + Number(m), 1);
+    Filter.kMonat = isoTag(d).slice(0, 7);
+    router();
+  });
+  $('#kAnsicht').addEventListener('change', (ev) => { Filter.kAnsicht = ev.target.value; router(); });
+  $$('[data-art]', view).forEach(cb => cb.addEventListener('change', () => {
+    Filter.kArten = $$('[data-art]', view).filter(x => x.checked).map(x => x.dataset.art);
+    router();
+  }));
+  $('#aboNeu').addEventListener('click', async () => {
+    if (abo.aktiv && !confirm('Neuen Link erstellen? Der bisherige Link funktioniert danach nicht mehr.')) return;
+    try {
+      const r = await api('kalender/abo', 'POST', {});
+      $('#aboLink').innerHTML = `<p class="warnline small">Diesen Link jetzt kopieren und im iPhone eintragen. Er wird nur dieses eine Mal angezeigt.</p>
+        <div class="btn-row"><input class="input" id="aboUrl" readonly value="${esc(r.link)}" aria-label="Kalender-Link"><button type="button" class="btn sm" id="aboCopy">Kopieren</button></div>`;
+      $('#aboCopy').addEventListener('click', () => copyText(r.link));
+      $('#aboNeu').textContent = 'Neuen Link erstellen (alter gilt dann nicht mehr)';
+      abo.aktiv = true;
+    } catch (e) { toast(e.message); }
+  });
+  $('#aboAus')?.addEventListener('click', async () => {
+    if (!confirm('Kalender-Abo abschalten? Der iPhone-Kalender bekommt danach keine Termine mehr.')) return;
+    try { await api('kalender/abo', 'DELETE'); toast('Abgeschaltet'); router(); } catch (e) { toast(e.message); }
+  });
+  if (App.kalenderExtra) App.kalenderExtra(view, { y, mo, start, ende });
 };

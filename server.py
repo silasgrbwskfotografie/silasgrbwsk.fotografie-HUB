@@ -43,7 +43,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from zoneinfo import ZoneInfo
 
-VERSION = "0.6"
+VERSION = "0.7"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -1178,6 +1178,179 @@ def audit_label(table, r):
     return next((r[k] for k in ("name", "titel") if k in keys and r[k]), "")
 
 
+def speichern(conn, table, data, old, user, fest=None):
+    """Eintrag anlegen (old=None) oder ändern, mit allen Regeln der Tabelle. fest: Werte, die nur der Server setzt
+    (zum Beispiel die Serien-Kennung). Rückgabe: der gespeicherte Eintrag als dict."""
+    cols = TABLES[table]
+    now = now_iso()
+    rid = old["id"] if old else None
+    vals = clean_values(table, data)
+    for f in SERVER_FIELDS.get(table, ()):
+        vals.pop(f, None)
+    vals.update(fest or {})
+    if table == "zahlungen":
+        zahlung_vorbereiten(conn, vals, old)
+    if table == "lieferlinks":
+        lieferlink_vorbereiten(conn, vals, old)
+    if not old:   # Vorgaben, damit die Prüfung auch beim Anlegen greift
+        for k, d in (("typ", "Verein"), ("status", "Angefragt")):
+            if k in cols and table in ("kunden", "auftraege") and not vals.get(k):
+                vals[k] = d
+    row = {**(row_dict(old) if old else {}), **vals}
+    check_row(conn, table, row)
+    if table == "auftraege":
+        pr = auftrag_preise(conn, row, old)
+        pr.pop("berechnet_cent")
+        vals.update(pr)
+        if not old or old["datum"] != row["datum"]:
+            tage = int(get_setting(conn, "lieferfrist_tage") or 0)
+            vals["lieferfrist"] = (date.fromisoformat(row["datum"]) + timedelta(days=tage)).isoformat()
+    if "geaendert_am" in cols:
+        vals["geaendert_am"] = now
+    if old:
+        if vals:
+            conn.execute(f"UPDATE {table} SET {', '.join(k + '=?' for k in vals)} WHERE id=?", list(vals.values()) + [rid])
+        changes = {k: [old[k], v] for k, v in vals.items()
+                   if k not in AUDIT_SKIP and str(old[k] if old[k] is not None else "") != str(v if v is not None else "")}
+    else:
+        if "erstellt_am" in cols:
+            vals["erstellt_am"] = now
+        rid = conn.execute(f"INSERT INTO {table} ({', '.join(vals)}) VALUES ({', '.join('?' for _ in vals)})",
+                           list(vals.values())).lastrowid
+        changes = {k: v for k, v in vals.items() if k not in AUDIT_SKIP and v not in (None, "")}
+    if table in ("auftraege", "zahlungen"):
+        zahlung_sync(conn, rid if table == "auftraege" else row["auftrag_id"])
+    if table == "lieferlinks" and not old:   # erster Link: der Auftrag gilt als geliefert
+        a = conn.execute("SELECT * FROM auftraege WHERE id=?", (row["auftrag_id"],)).fetchone()
+        if a and a["status"] in ("Angefragt", "Bestätigt", "Fotografiert"):
+            conn.execute("UPDATE auftraege SET status='Geliefert', geaendert_am=? WHERE id=?", (now, a["id"]))
+            audit(conn, user, "geändert", "auftraege", a["id"], audit_label("auftraege", a),
+                  {"status": [a["status"], "Geliefert"], "Grund": "Galerie-Link eingetragen"})
+    r = conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone()
+    if changes:
+        audit(conn, user, "geändert" if old else "neu", table, rid, audit_label(table, r), changes)
+    out = row_dict(r)
+    if table == "auftraege":
+        mit_ampel(conn, [out])
+    if table == "vertraege":
+        mit_fristen([out])
+    return out
+
+
+def auftraege_im_zeitraum(conn, von, bis):
+    rows = [row_dict(r) for r in conn.execute(
+        "SELECT a.*, k.name AS kunde FROM auftraege a LEFT JOIN kunden k ON k.id = a.kunde_id "
+        "WHERE IFNULL(a.archiviert, 0)=0 AND a.datum >= ? AND a.datum <= ? ORDER BY a.datum, a.uhrzeit, a.id", (von, bis))]
+    return mit_ampel(conn, rows)
+
+
+def dashboard(conn, tag):
+    t = date.fromisoformat(tag)
+    lief = lieferung_uebersicht(conn, tag)
+    u = umsatz(conn, t.year)
+    offen = [row_dict(r) for r in conn.execute(
+        "SELECT z.id, z.betrag_cent, z.art, a.id AS auftrag_id, a.datum, a.begegnung, k.name AS kunde FROM zahlungen z "
+        "JOIN auftraege a ON a.id = z.auftrag_id LEFT JOIN kunden k ON k.id = a.kunde_id "
+        "WHERE z.status='Offen' AND a.status != 'Abgesagt' ORDER BY a.datum, z.id")]
+    vertraege = mit_fristen([row_dict(r) for r in conn.execute(
+        "SELECT v.*, k.name AS kunde FROM vertraege v LEFT JOIN kunden k ON k.id = v.kunde_id WHERE IFNULL(v.archiviert, 0)=0")])
+    grenze = (t + timedelta(days=60)).isoformat()
+    return {
+        "heute": tag,
+        "termine": [a for a in auftraege_im_zeitraum(conn, tag, (t + timedelta(days=14)).isoformat()) if a["status"] != "Abgesagt"],
+        "ueberfaellig": lief["ueberfaellig"],
+        "offen": offen, "offen_summe": sum(z["betrag_cent"] or 0 for z in offen),
+        "links_ablauf": lief["laeuft_ab"],
+        "vertraege": sorted((v for v in vertraege if v["kuendigen_bis"] and tag <= v["kuendigen_bis"] <= grenze),
+                            key=lambda v: v["kuendigen_bis"]),
+        "umsatz_jahr": u["summe"], "umsatz_grenze": u["grenze"], "jahr": t.year,
+    }
+
+
+def kalender_eintraege(conn, von, bis):
+    """Alles, was der Kalender zeigt, im Zeitraum von bis bis (JJJJ-MM-TT). art: auftrag, lieferfrist, vertrag, ablauf."""
+    out = []
+    for a in auftraege_im_zeitraum(conn, von, bis):
+        out.append({"art": "auftrag", "id": a["id"], "datum": a["datum"], "uhrzeit": a["uhrzeit"] or "", "titel": a["begegnung"] or "Auftrag",
+                    "ort": a["ort"] or "", "kunde": a["kunde"] or "", "status": a["status"], "ampel": a["ampel"]})
+    for a in mit_ampel(conn, [row_dict(r) for r in conn.execute(
+            "SELECT * FROM auftraege WHERE IFNULL(archiviert, 0)=0 AND lieferfrist >= ? AND lieferfrist <= ?", (von, bis))]):
+        if a["ampel"] in ("rot", "gelb"):
+            out.append({"art": "lieferfrist", "id": a["id"], "datum": a["lieferfrist"], "uhrzeit": "", "titel": "Lieferfrist: " + (a["begegnung"] or "Auftrag")})
+    for v in mit_fristen([row_dict(r) for r in conn.execute(
+            "SELECT v.*, k.name AS kunde FROM vertraege v LEFT JOIN kunden k ON k.id = v.kunde_id WHERE IFNULL(v.archiviert, 0)=0")]):
+        if v["kuendigen_bis"] and von <= v["kuendigen_bis"] <= bis:
+            out.append({"art": "vertrag", "id": v["id"], "datum": v["kuendigen_bis"], "uhrzeit": "", "titel": f"Kündigen bis: {v['kunde'] or ''} ({v['art']})"})
+    for l in conn.execute("SELECT l.id, l.auftrag_id, l.typ, l.laeuft_ab_am, a.begegnung FROM lieferlinks l JOIN auftraege a ON a.id = l.auftrag_id "
+                          "WHERE l.laeuft_ab_am >= ? AND l.laeuft_ab_am <= ?", (von, bis)):
+        out.append({"art": "ablauf", "id": l["auftrag_id"], "datum": l["laeuft_ab_am"], "uhrzeit": "", "titel": f"{l['typ']}-Link läuft ab: {l['begegnung'] or ''}"})
+    return sorted(out, key=lambda e: (e["datum"], e["uhrzeit"] or "99"))
+
+
+def ics_text(v):
+    return str(v or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\r\n", "\\n").replace("\n", "\\n")
+
+
+def ics_falten(zeile):
+    """RFC 5545: Zeilen höchstens 75 Bytes, Fortsetzung beginnt mit einem Leerzeichen."""
+    b = zeile.encode("utf-8")
+    teile = []
+    while len(b) > 75:
+        cut = 75 if not teile else 74
+        while cut > 0 and (b[cut] & 0xC0) == 0x80:   # nicht mitten in einem UTF-8-Zeichen trennen
+            cut -= 1
+        teile.append(b[:cut].decode("utf-8"))
+        b = b[cut:]
+    teile.append(b.decode("utf-8"))
+    return "\r\n ".join(teile)
+
+
+ICS_DAUER_MIN = 120   # shortcut: Aufträge haben keine Endzeit, im Kalender-Abo stehen sie mit 2 Stunden; bei Bedarf Feld "Ende" ergänzen
+
+
+def ics_kalender(conn):
+    """Kalender-Abo: nur Termin, Ort und Begegnung. Keine Beträge, keine Kontaktdaten."""
+    stamp = datetime.now(TZ).astimezone(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
+    host = DOMAIN or "studio-tool.local"
+    z = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//silasgrbwsk.fotografie//Studio-Tool//DE", "CALSCALE:GREGORIAN",
+         "X-WR-CALNAME:Studio-Tool", "X-WR-TIMEZONE:Europe/Berlin"]
+    seit = (date.fromisoformat(heute()) - timedelta(days=90)).isoformat()
+    for a in conn.execute("SELECT * FROM auftraege WHERE IFNULL(archiviert, 0)=0 AND status != 'Abgesagt' AND datum >= ? ORDER BY datum",
+                          (seit,)):
+        z += ["BEGIN:VEVENT", f"UID:auftrag-{a['id']}@{host}", f"DTSTAMP:{stamp}"]
+        if a["uhrzeit"]:
+            beginn = datetime.fromisoformat(f"{a['datum']}T{a['uhrzeit']}").replace(tzinfo=TZ).astimezone(ZoneInfo("UTC"))
+            z += [f"DTSTART:{beginn:%Y%m%dT%H%M%SZ}", f"DTEND:{beginn + timedelta(minutes=ICS_DAUER_MIN):%Y%m%dT%H%M%SZ}"]
+        else:
+            d = date.fromisoformat(a["datum"])
+            z += [f"DTSTART;VALUE=DATE:{d:%Y%m%d}", f"DTEND;VALUE=DATE:{d + timedelta(days=1):%Y%m%d}"]
+        z.append("SUMMARY:" + ics_text(a["begegnung"] or "Auftrag"))
+        if a["ort"]:
+            z.append("LOCATION:" + ics_text(a["ort"]))
+        z.append("END:VEVENT")
+    z.append("END:VCALENDAR")
+    return "\r\n".join(ics_falten(x) for x in z) + "\r\n"
+
+
+def serie_anlegen(conn, data, user):
+    """Mehrere Aufträge eines Kunden in einem Schritt. Alles oder nichts: ein Fehler rollt die ganze Serie zurück."""
+    termine = data.get("termine")
+    if not isinstance(termine, list) or not 1 <= len(termine) <= 100:
+        raise BadRequest("Bitte 1 bis 100 Termine angeben.")
+    gemeinsam = {k: data.get(k) for k in ("kunde_id", "paket_id", "ort", "sportart", "km", "spieler", "status", "notizen") if k in data}
+    serie = secrets.token_hex(6)
+    out = []
+    for i, t in enumerate(termine, 1):
+        if not isinstance(t, dict):
+            raise BadRequest(f"Termin {i}: ungültige Angaben.")
+        try:
+            out.append(speichern(conn, "auftraege", {**gemeinsam, **{k: t.get(k) for k in ("datum", "uhrzeit", "begegnung") if t.get(k)}},
+                                 None, user, fest={"serie": serie}))
+        except BadRequest as e:
+            raise BadRequest(f"Termin {i}: {e}")
+    return out
+
+
 class _Discard:
     """Bei HEAD-Anfragen: Inhalt verwerfen, Leeren und Schließen an die echte Verbindung weitergeben."""
     def __init__(self, real):
@@ -1364,6 +1537,8 @@ class Handler(BaseHTTPRequestHandler):
         # ---- öffentlich ----
         if method == "GET" and p == ["healthz"]:
             return self.send_json({"ok": True, "version": VERSION})
+        if method == "GET" and head == "kalender" and len(p) == 2 and re.fullmatch(r"[A-Za-z0-9_-]{20,80}\.ics", p[1]):
+            return self.ics_abo(p[1][:-4])
         if method == "GET" and p == ["robots.txt"]:
             body = b"User-agent: *\nDisallow: /\n"
             self.send_response(200)
@@ -1533,6 +1708,33 @@ class Handler(BaseHTTPRequestHandler):
             return self.wfile.write(body)
         if head == "datei" and len(p) == 3 and p[1] in DATEI_TABELLEN and re.fullmatch(r"[0-9]{1,9}", p[2]):
             return self.api_datei(method, p[1], int(p[2]), user)
+        if method == "GET" and p == ["dashboard"]:
+            with db() as conn:
+                return self.send_json(dashboard(conn, heute()))
+        if method == "GET" and p == ["kalender"]:
+            q = parse_qs(urlparse(self.path).query)
+            von, bis = (q.get("von") or [""])[0], (q.get("bis") or [""])[0]
+            try:
+                if date.fromisoformat(bis) - date.fromisoformat(von) > timedelta(days=400) or bis < von:
+                    raise ValueError
+            except ValueError:
+                raise BadRequest("Zeitraum bitte als von und bis (JJJJ-MM-TT), höchstens 400 Tage.")
+            with db() as conn:
+                return self.send_json(kalender_eintraege(conn, von, bis))
+        if p == ["kalender", "abo"] and method in ("GET", "POST", "DELETE"):
+            with db() as conn:
+                if method == "POST":   # neuer Link: der alte gilt danach nicht mehr. Gespeichert wird nur der Hash.
+                    tok = secrets.token_urlsafe(32)
+                    set_setting(conn, "ics_token_hash", token_hash(tok))
+                    audit(conn, user, "Kalender-Abo neu erstellt", "settings", None, "Kalender-Abo")
+                    return self.send_json({"aktiv": True, "link": f"{SITE_URL}/kalender/{tok}.ics"})
+                if method == "DELETE":
+                    set_setting(conn, "ics_token_hash", "")
+                    audit(conn, user, "Kalender-Abo abgeschaltet", "settings", None, "Kalender-Abo")
+                return self.send_json({"aktiv": bool(get_setting(conn, "ics_token_hash"))})
+        if method == "POST" and p == ["auftraege", "serie"]:
+            with db() as conn:
+                return self.send_json(serie_anlegen(conn, self.read_json(), user), 201)
         if method == "GET" and p == ["lieferung"]:
             with db() as conn:
                 return self.send_json(lieferung_uebersicht(conn, heute()))
@@ -1590,55 +1792,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(rows[0] if old else rows)
 
             if (method == "POST" and rid is None) or (method == "PUT" and old):
-                vals = clean_values(table, self.read_json())
-                for f in SERVER_FIELDS.get(table, ()):
-                    vals.pop(f, None)
-                if table == "zahlungen":
-                    zahlung_vorbereiten(conn, vals, old)
-                if table == "lieferlinks":
-                    lieferlink_vorbereiten(conn, vals, old)
-                if not old:   # Vorgaben, damit die Prüfung auch beim Anlegen greift
-                    for k, d in (("typ", "Verein"), ("status", "Angefragt")):
-                        if k in cols and table in ("kunden", "auftraege") and not vals.get(k):
-                            vals[k] = d
-                row = {**(row_dict(old) if old else {}), **vals}
-                check_row(conn, table, row)
-                if table == "auftraege":
-                    pr = auftrag_preise(conn, row, old)
-                    pr.pop("berechnet_cent")
-                    vals.update(pr)
-                    if not old or old["datum"] != row["datum"]:
-                        tage = int(get_setting(conn, "lieferfrist_tage") or 0)
-                        vals["lieferfrist"] = (date.fromisoformat(row["datum"]) + timedelta(days=tage)).isoformat()
-                if "geaendert_am" in cols:
-                    vals["geaendert_am"] = now
-                if old:
-                    if vals:
-                        conn.execute(f"UPDATE {table} SET {', '.join(k + '=?' for k in vals)} WHERE id=?", list(vals.values()) + [rid])
-                    changes = {k: [old[k], v] for k, v in vals.items()
-                               if k not in AUDIT_SKIP and str(old[k] if old[k] is not None else "") != str(v if v is not None else "")}
-                else:
-                    if "erstellt_am" in cols:
-                        vals["erstellt_am"] = now
-                    rid = conn.execute(f"INSERT INTO {table} ({', '.join(vals)}) VALUES ({', '.join('?' for _ in vals)})",
-                                       list(vals.values())).lastrowid
-                    changes = {k: v for k, v in vals.items() if k not in AUDIT_SKIP and v not in (None, "")}
-                if table in ("auftraege", "zahlungen"):
-                    zahlung_sync(conn, rid if table == "auftraege" else row["auftrag_id"])
-                if table == "lieferlinks" and not old:   # erster Link: der Auftrag gilt als geliefert
-                    a = conn.execute("SELECT * FROM auftraege WHERE id=?", (row["auftrag_id"],)).fetchone()
-                    if a and a["status"] in ("Angefragt", "Bestätigt", "Fotografiert"):
-                        conn.execute("UPDATE auftraege SET status='Geliefert', geaendert_am=? WHERE id=?", (now, a["id"]))
-                        audit(conn, user, "geändert", "auftraege", a["id"], audit_label("auftraege", a),
-                              {"status": [a["status"], "Geliefert"], "Grund": "Galerie-Link eingetragen"})
-                r = conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone()
-                if changes:
-                    audit(conn, user, "geändert" if old else "neu", table, rid, audit_label(table, r), changes)
-                out = row_dict(r)
-                if table == "auftraege":
-                    mit_ampel(conn, [out])
-                if table == "vertraege":
-                    mit_fristen([out])
+                out = speichern(conn, table, self.read_json(), old, user)
                 return self.send_json(out, 200 if old else 201)
 
             if method == "DELETE" and old:
@@ -1665,6 +1819,21 @@ class Handler(BaseHTTPRequestHandler):
                       {k: v for k, v in row_dict(old).items() if k not in AUDIT_SKIP and v not in (None, "")})
                 return self.send_json({"ok": True})
         return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+
+    # -- Kalender-Abo (öffentlich, nur mit dem geheimen Link) -------------
+    def ics_abo(self, tok):
+        with db() as conn:
+            soll = get_setting(conn, "ics_token_hash")
+            if not soll or not hmac.compare_digest(soll, token_hash(tok)):
+                time.sleep(0.3)
+                return self.send_error(404)
+            body = ics_kalender(conn).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/calendar; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "private, max-age=300")
+        self.end_headers()
+        return self.wfile.write(body)
 
     # -- Dateien zu Verträgen und Dokumenten (/api/datei/<tabelle>/<id>) ----
     def api_datei(self, method, table, rid, user):

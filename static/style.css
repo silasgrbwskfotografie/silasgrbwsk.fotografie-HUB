@@ -176,3 +176,29 @@ a.linkbtn{text-decoration:none}
 .link-zeile{padding:10px 0;border-bottom:1px solid var(--line)}
 .link-zeile .url{display:block;overflow-wrap:anywhere;margin:2px 0}
 #lNeu{margin-top:10px}
+
+/* Phase 6: Startseite, Kalender */
+.gross{font-size:26px;font-weight:700;margin:0 0 8px}
+.kal-monat{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.kal-kopf{background:var(--bg);font-size:12px;font-weight:600;color:var(--ink-3);padding:6px;text-align:center}
+.kal-tag{background:var(--card);min-height:92px;padding:4px;display:flex;flex-direction:column;gap:3px;min-width:0}
+.kal-tag.fremd{background:var(--bg)}
+.kal-tag.fremd .kal-nr{color:var(--ink-3)}
+.kal-tag.heute .kal-nr{background:var(--ink);color:#fff;border-radius:99px;padding:0 7px}
+.kal-nr{font-size:12px;font-weight:600;align-self:flex-start}
+.kal-chip{display:block;font-size:12px;line-height:1.3;padding:2px 6px;border-radius:6px;background:var(--accent-soft);color:var(--ink);text-decoration:none;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.check .kal-chip{display:inline-block}
+.kal-chip.lieferfrist{background:var(--warn-soft);color:var(--warn)}
+.kal-chip.vertrag{background:var(--bad-soft);color:var(--bad)}
+.kal-chip.ablauf{background:var(--bg);color:var(--ink-2);border:1px solid var(--line)}
+.kal-chip.termin{background:#e7eefb;color:#234a8a}
+.kal-chip.aufgabe{background:var(--ok-soft);color:var(--ok)}
+.kal-chip.extern{background:#efe9f6;color:#5b3f86}
+.kal-chip.abgesagt{text-decoration:line-through;opacity:.6}
+.kal-agenda{padding:10px 0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:4px}
+.kal-agenda .kal-chip{white-space:normal;font-size:14px;padding:6px 8px}
+.kal-agenda.heute .kal-datum{color:var(--accent)}
+#aboCard{margin-top:14px}
+#aboUrl{flex:1;min-width:0}
+@media (max-width:700px){.kal-tag{min-height:64px}.kal-monat .kal-chip{font-size:10px;padding:1px 3px}}
