@@ -209,6 +209,8 @@ Regeln für die Umsetzung:
 - Phase 3: Ein Auftrag lässt sich nur löschen, solange seine Zahlungen offen und nicht abgerechnet sind. Sonst archivieren.
 - Entschieden am 14.11.2026 (Phase 4): Ein Auftrag gilt als geliefert, sobald ein Galerie-Link eingetragen ist. Steht der Status noch auf Angefragt, Bestätigt oder Fotografiert, wechselt er auf Geliefert.
 - Phase 4: Lieferfrist-Ampel rot = Frist vorbei, gelb = Spiel war und Frist läuft, grün = geliefert. Galerie-Links nur mit https://.
+- Phase 5: Vertragsende = festes Ende oder Beginn plus Mindestlaufzeit minus 1 Tag. "Spätestens kündigen bis" = Ende minus Frist (Monate zum Monatsende abgeschnitten). Verlängert sich der Vertrag und ist die Frist vorbei, zählt die nächste Periode. Uploads nur PDF bis 15 MB, am Inhalt geprüft.
+- Entschieden am 14.11.2026: Alle weiteren Phasen am Stück, Commit nach jeder Phase. Kalender liest zusätzlich einen fremden ICS-Link ein. Fahrtenbuch-Karte mit OpenStreetMap-Kacheln. Aufgaben-Vorlagen je Paket aus der Liste dieser Planung.
 
 ## Technik und Architektur
 

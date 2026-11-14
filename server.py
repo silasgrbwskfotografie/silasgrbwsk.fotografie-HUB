@@ -21,6 +21,7 @@ Konfiguration über Umgebungsvariablen (auf dem Server aus der .env):
 """
 
 import base64
+import calendar
 import contextlib
 import csv
 import io
@@ -39,10 +40,10 @@ import time
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from zoneinfo import ZoneInfo
 
-VERSION = "0.5"
+VERSION = "0.6"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -167,6 +168,7 @@ TABLES = {
         "mindestlaufzeit_monate": "INTEGER",
         "kuendigungsfrist_wert": "INTEGER",
         "kuendigungsfrist_einheit": "TEXT DEFAULT 'Monate'",   # Tage / Wochen / Monate
+        "verlaengerung_monate": "INTEGER",               # leer oder 0: endet; sonst verlängert sich um so viele Monate
         "ende": "TEXT",
         "datei": "TEXT",                                 # zufälliger Dateiname unter uploads/
         "datei_name": "TEXT",                            # ursprünglicher Name für den Download
@@ -691,16 +693,19 @@ def twofa_reset(username):
 # ---------------------------------------------------------------------------
 # Phase 2: Kunden, Kontakte, Pakete, Aufträge (allgemeine Tabellen-Schnittstelle wie api_table im Hub)
 # ---------------------------------------------------------------------------
-API_TABLES = ("kunden", "kontakte", "pakete", "auftraege", "zahlungen", "lieferlinks", "vorlagen")
+API_TABLES = ("kunden", "kontakte", "pakete", "auftraege", "zahlungen", "lieferlinks", "vorlagen", "vertraege", "dokumente")
 ORDER = {"kunden": "name COLLATE NOCASE, id", "kontakte": "name COLLATE NOCASE, id", "pakete": "sort, id",
          "auftraege": "datum, uhrzeit, id", "zahlungen": "auftrag_id, art = 'Zahlung', id",
-         "lieferlinks": "auftrag_id, erstellt_am, id", "vorlagen": "sort, id"}
+         "lieferlinks": "auftrag_id, erstellt_am, id", "vorlagen": "sort, id", "vertraege": "beginn, id",
+         "dokumente": "hochgeladen_am DESC, id"}
 # Diese Felder setzt nur der Server (Preise, Fristen, Zeitstempel)
 SERVER_FIELDS = {
     "kunden": ("erstellt_am", "geaendert_am"),
     "kontakte": ("erstellt_am", "geaendert_am", "anonymisiert"),
     "zahlungen": ("erstellt_am", "geaendert_am"),
     "lieferlinks": ("erstellt_am",),
+    "vertraege": ("erstellt_am", "geaendert_am", "datei", "datei_name"),
+    "dokumente": ("hochgeladen_am", "datei", "datei_name", "groesse"),
     "auftraege": ("erstellt_am", "geaendert_am", "serie", "grundpreis_cent", "inkl_spieler", "zusatz_je_spieler_cent",
                   "anfahrt_frei_km", "anfahrt_cent_je_km", "zusatzspieler_cent", "anfahrt_cent", "lieferfrist"),
 }
@@ -801,6 +806,106 @@ def check_row(conn, table, row):
                 raise BadRequest("Bitte ein gültiges Ablaufdatum eingeben.")
     if table == "vorlagen" and (not row.get("name") or not row.get("text")):
         raise BadRequest("Bitte Name und Text der Vorlage eingeben.")
+    if table == "vertraege":
+        if not row.get("kunde_id"):
+            raise BadRequest("Der Vertrag braucht einen Kunden.")
+        if row.get("art") not in VERTRAG_ARTEN:
+            raise BadRequest("Bitte die Art des Vertrags wählen.")
+        for k, name in (("beginn", "Beginn"), ("ende", "Ende")):
+            if row.get(k) or k == "beginn":
+                try:
+                    date.fromisoformat(row.get(k) or "")
+                except ValueError:
+                    raise BadRequest(f"Bitte ein gültiges Datum für {name} eingeben.")
+        if row.get("ende") and row["ende"] < row["beginn"]:
+            raise BadRequest("Das Ende liegt vor dem Beginn.")
+        if (row.get("kuendigungsfrist_einheit") or "Monate") not in FRIST_EINHEITEN:
+            raise BadRequest("Unbekannte Einheit der Kündigungsfrist.")
+    if table == "dokumente" and (not row.get("kunde_id") or not row.get("titel")):
+        raise BadRequest("Bitte Kunde und Titel eingeben.")
+
+
+FRIST_EINHEITEN = ("Tage", "Wochen", "Monate")
+
+
+def plus_monate(d, n):
+    """Monate addieren, am Monatsende abgeschnitten: 31.07. minus 3 Monate = 30.04."""
+    y, m = divmod(d.month - 1 + n, 12)
+    y += d.year
+    return date(y, m + 1, min(d.day, calendar.monthrange(y, m + 1)[1]))
+
+
+def vertragsfristen(v, tag):
+    """Aktuelles Laufzeitende und "spätestens kündigen bis" am Tag tag (JJJJ-MM-TT).
+    Ende: eingetragenes Ende, sonst Beginn plus Mindestlaufzeit minus 1 Tag. Verlängert sich der Vertrag und ist die
+    Kündigungsfrist der laufenden Periode schon vorbei, zählt die nächste Periode. Ohne Gewähr, maßgeblich ist der Vertrag."""
+    try:
+        beginn = date.fromisoformat(v.get("beginn") or "")
+    except ValueError:
+        return {"laufzeit_ende": None, "kuendigen_bis": None, "vertrag_status": "unvollständig"}
+    t = date.fromisoformat(tag)
+    if v.get("ende"):
+        ende = date.fromisoformat(v["ende"])
+    elif v.get("mindestlaufzeit_monate"):
+        ende = plus_monate(beginn, v["mindestlaufzeit_monate"]) - timedelta(days=1)
+    else:
+        return {"laufzeit_ende": None, "kuendigen_bis": None, "vertrag_status": "unbefristet"}
+    verl = v.get("verlaengerung_monate") or 0
+    n, einheit = v.get("kuendigungsfrist_wert") or 0, v.get("kuendigungsfrist_einheit") or "Monate"
+
+    def frist(e):
+        if not n:
+            return None
+        if einheit == "Monate":
+            return plus_monate(e, -n)
+        return e - timedelta(days=n * (7 if einheit == "Wochen" else 1))
+
+    for _ in range(600):   # höchstens 600 Verlängerungen, schützt vor Endlosschleifen bei kaputten Daten
+        kb = frist(ende)
+        if not verl or (kb or ende) >= t:
+            break
+        ende = plus_monate(ende + timedelta(days=1), verl) - timedelta(days=1)
+    status = "beendet" if not verl and ende < t else ("verlängert sich" if verl else "endet")
+    return {"laufzeit_ende": ende.isoformat(), "kuendigen_bis": kb.isoformat() if kb else None, "vertrag_status": status}
+
+
+def mit_fristen(rows):
+    tag = heute()
+    for d in rows:
+        d.update(vertragsfristen(d, tag))
+    return rows
+
+
+# Uploads: nur erlaubte Dateitypen, am Inhalt geprüft, unter zufälligem Namen in data/uploads, nie öffentlich
+DATEI_TABELLEN = {"vertraege": ("pdf",), "dokumente": ("pdf",)}
+DATEI_ARTEN = {"pdf": (b"%PDF-", ".pdf", "application/pdf"), "jpg": (b"\xff\xd8\xff", ".jpg", "image/jpeg"),
+               "png": (b"\x89PNG\r\n\x1a\n", ".png", "image/png")}
+DATEI_MAX = 15 * 1024 * 1024
+
+
+def datei_speichern(raw_b64, name, erlaubt):
+    """Data-URL prüfen und speichern. Rückgabe: (Dateiname auf der Platte, Anzeigename, Größe)."""
+    m = re.match(r"^data:[\w/+.-]*;base64,(.*)$", raw_b64 or "", re.S)
+    if not m:
+        raise BadRequest("Ungültige Datei.")
+    try:
+        data = base64.b64decode(m.group(1), validate=True)
+    except ValueError:
+        raise BadRequest("Ungültige Datei.")
+    if len(data) > DATEI_MAX:
+        raise BadRequest(f"Die Datei ist größer als {DATEI_MAX // 1024 // 1024} MB.")
+    art = next((k for k in erlaubt if data.startswith(DATEI_ARTEN[k][0])), None)
+    if not art:
+        raise BadRequest("Erlaubt sind nur " + ", ".join(k.upper() for k in erlaubt) + " Dateien.")
+    fname = secrets.token_hex(16) + DATEI_ARTEN[art][1]
+    (UPLOADS / fname).write_bytes(data)
+    anzeige = re.sub(r"[\x00-\x1f/\\]", "", Path(str(name or "")).name).strip()[:120] or "datei" + DATEI_ARTEN[art][1]
+    return fname, anzeige, len(data)
+
+
+def datei_loeschen(fname):
+    if fname and re.fullmatch(r"[0-9a-f]{32}\.[a-z]{3}", fname):
+        (UPLOADS / fname).unlink(missing_ok=True)
 
 
 def lieferlink_vorbereiten(conn, vals, old):
@@ -1067,7 +1172,10 @@ def audit_label(table, r):
         return f"{r['art']} zu Auftrag {r['auftrag_id']}"
     if table == "lieferlinks":
         return f"{r['typ']}-Link zu Auftrag {r['auftrag_id']}"
-    return r["name"] or ""
+    if table == "vertraege":
+        return f"{r['art']} ab {datum_text(r['beginn'])}"
+    keys = r.keys()
+    return next((r[k] for k in ("name", "titel") if k in keys and r[k]), "")
 
 
 class _Discard:
@@ -1152,12 +1260,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def read_json(self):
+    def read_json(self, limit=MAX_JSON):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             raise PayloadTooLarge()
-        if length > MAX_JSON or length < 0:
+        if length > limit or length < 0:
             raise PayloadTooLarge()
         raw = self.rfile.read(length) if length else b""
         try:
@@ -1423,6 +1531,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return self.wfile.write(body)
+        if head == "datei" and len(p) == 3 and p[1] in DATEI_TABELLEN and re.fullmatch(r"[0-9]{1,9}", p[2]):
+            return self.api_datei(method, p[1], int(p[2]), user)
         if method == "GET" and p == ["lieferung"]:
             with db() as conn:
                 return self.send_json(lieferung_uebersicht(conn, heute()))
@@ -1475,6 +1585,8 @@ class Handler(BaseHTTPRequestHandler):
                 rows = [row_dict(r) for r in ([old] if old else conn.execute(f"SELECT * FROM {table} ORDER BY {ORDER[table]}"))]
                 if table == "auftraege":
                     mit_ampel(conn, rows)
+                if table == "vertraege":
+                    mit_fristen(rows)
                 return self.send_json(rows[0] if old else rows)
 
             if (method == "POST" and rid is None) or (method == "PUT" and old):
@@ -1525,6 +1637,8 @@ class Handler(BaseHTTPRequestHandler):
                 out = row_dict(r)
                 if table == "auftraege":
                     mit_ampel(conn, [out])
+                if table == "vertraege":
+                    mit_fristen([out])
                 return self.send_json(out, 200 if old else 201)
 
             if method == "DELETE" and old:
@@ -1545,10 +1659,47 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
                 if table == "zahlungen":
                     zahlung_sync(conn, old["auftrag_id"])
+                if table in DATEI_TABELLEN:
+                    datei_loeschen(old["datei"])
                 audit(conn, user, "gelöscht", table, rid, audit_label(table, old),
                       {k: v for k, v in row_dict(old).items() if k not in AUDIT_SKIP and v not in (None, "")})
                 return self.send_json({"ok": True})
         return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+
+    # -- Dateien zu Verträgen und Dokumenten (/api/datei/<tabelle>/<id>) ----
+    def api_datei(self, method, table, rid, user):
+        with db() as conn:
+            r = conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone()
+            if not r:
+                return self.send_json({"error": "Diesen Eintrag gibt es nicht."}, 404)
+            if method == "POST":
+                data = self.read_json(limit=DATEI_MAX * 4 // 3 + 4096)
+                fname, anzeige, groesse = datei_speichern(data.get("data"), data.get("name"), DATEI_TABELLEN[table])
+                vals = {"datei": fname, "datei_name": anzeige}
+                if table == "dokumente":
+                    vals.update(groesse=groesse, hochgeladen_am=now_iso())
+                conn.execute(f"UPDATE {table} SET {', '.join(k + '=?' for k in vals)} WHERE id=?", [*vals.values(), rid])
+                audit(conn, user, "Datei hochgeladen", table, rid, anzeige, {"Größe": groesse})
+                alt = r["datei"]
+                out = row_dict(conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone())
+            elif method == "GET":
+                if not r["datei"] or not (UPLOADS / r["datei"]).is_file():
+                    return self.send_json({"error": "Keine Datei vorhanden."}, 404)
+                body = (UPLOADS / r["datei"]).read_bytes()
+                ctype = next(v[2] for v in DATEI_ARTEN.values() if r["datei"].endswith(v[1]))
+                art = "attachment" if "download=1" in urlparse(self.path).query else "inline"
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Disposition", f"{art}; filename*=UTF-8''{quote(r['datei_name'] or r['datei'])}")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "private, no-store")
+                self.end_headers()
+                return self.wfile.write(body)
+            else:
+                return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+        if alt and alt != fname:   # erst nach dem Speichern: die alte Datei wird nicht mehr gebraucht
+            datei_loeschen(alt)
+        return self.send_json(out)
 
     # -- Eigenes Passwort ändern (/api/me/passwort) -------------------------
     def api_passwort(self, user):

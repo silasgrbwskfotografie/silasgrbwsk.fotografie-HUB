@@ -21,6 +21,10 @@ function fieldHtml(f, val) {
   if (f.type === 'check') {
     return `<div class="field${f.full ? ' full' : ''}"><label class="check"><input type="checkbox" id="${id}" name="${f.key}"${Number(v) ? ' checked' : ''}> ${esc(f.label)}</label></div>`;
   }
+  if (f.type === 'file') {
+    return `<div class="field${f.full ? ' full' : ''}"><label for="${id}">${esc(f.label)}</label>
+      <input class="input" id="${id}" name="${f.key}" type="file" accept="${esc(f.accept || '')}">${v ? `<span class="muted small">Vorhanden: ${esc(v)}. Eine neue Datei ersetzt sie.</span>` : ''}</div>`;
+  }
   let input;
   if (f.type === 'select') {
     input = `<select class="input" id="${id}" name="${f.key}"${req}>` + f.options.map(([w, t]) =>
@@ -42,6 +46,7 @@ function fieldHtml(f, val) {
 function readForm(form, fields) {
   const out = {};
   for (const f of fields) {
+    if (f.type === 'file') continue;   // Dateien lädt editRecord nach dem Speichern hoch
     const el = form.elements[f.key];
     out[f.key] = f.type === 'check' ? (el.checked ? 1 : 0) : f.type === 'euro' ? centVon(el.value) : el.value.trim();
   }
@@ -66,7 +71,16 @@ function editRecord(table, title, fields, rec = {}, opts = {}) {
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     try {
-      fertig('Gespeichert', 'save', await api(url, rec.id ? 'PUT' : 'POST', { ...readForm(form, fields), ...(opts.fix || {}) }));
+      const r = await api(url, rec.id ? 'PUT' : 'POST', { ...readForm(form, fields), ...(opts.fix || {}) });
+      try {
+        for (const f of fields.filter(x => x.type === 'file')) {
+          const file = form.elements[f.key].files[0];
+          if (file) await dateiHochladen(table, r.id, file);
+        }
+      } catch (e) {   // der Eintrag ist schon gespeichert: Dialog schließen, sonst legt ein zweiter Versuch ihn doppelt an
+        return fertig('Gespeichert, aber ohne Datei: ' + e.message, 'save', r);
+      }
+      fertig('Gespeichert', 'save', r);
     } catch (e) { toast(e.message); }
   });
   form.addEventListener('click', async (ev) => {
@@ -563,5 +577,81 @@ App.pages.einstellungen = async (view) => {
       await api('einstellungen', 'PUT', readForm(ev.target, werte));
       toast('Gespeichert');
     } catch (e) { toast(e.message); }
+  });
+};
+
+/* ---------- Dateien ---------- */
+const DATEI_MAX_MB = 15;
+async function dateiHochladen(table, id, file) {
+  if (file.size > DATEI_MAX_MB * 1024 * 1024) throw new Error(`Die Datei ist größer als ${DATEI_MAX_MB} MB.`);
+  const data = await new Promise((ok, fehler) => {
+    const fr = new FileReader();
+    fr.onload = () => ok(fr.result);
+    fr.onerror = () => fehler(new Error('Die Datei ließ sich nicht lesen.'));
+    fr.readAsDataURL(file);
+  });
+  return api(`datei/${table}/${id}`, 'POST', { name: file.name, data });
+}
+const dateiKnoepfe = (table, x) => x.datei ? `<a class="btn sm" href="/api/datei/${table}/${x.id}" target="_blank" rel="noopener">Ansehen</a>
+  <a class="btn sm" href="/api/datei/${table}/${x.id}?download=1">Herunterladen</a>` : '<span class="muted small">keine Datei</span>';
+const groesse = n => n > 1048576 ? (n / 1048576).toFixed(1).replace('.', ',') + ' MB' : Math.max(1, Math.round((n || 0) / 1024)) + ' KB';
+
+/* ---------- Verträge und Dokumente ---------- */
+const VERTRAG_ARTEN = ['Saisonvertrag', 'Einwilligungs- und Nutzungsvereinbarung', 'Sponsoring'];
+function fristBadge(v) {
+  if (!v.kuendigen_bis) return '';
+  const n = tageBis(v.kuendigen_bis);
+  if (n < 0) return `<span class="badge plain">Frist war ${datum(v.kuendigen_bis)}</span>`;
+  return `<span class="badge ${n <= 14 ? 'bad' : n <= 60 ? 'warn' : 'plain'}">kündigen bis ${datum(v.kuendigen_bis)}</span>`;
+}
+
+App.pages.vertraege = async (view) => {
+  const [vertraege, dokumente, kunden] = await Promise.all([api('vertraege'), api('dokumente'), api('kunden')]);
+  const kname = id => byId(kunden, id)?.name || '';
+  const kundenOpt = (id) => [['', 'bitte wählen']].concat(kunden.filter(k => !k.archiviert || k.id === id).map(k => [k.id, k.name]));
+  const vertragFelder = v => [
+    { key: 'kunde_id', label: 'Kunde', type: 'select', required: true, options: kundenOpt(v.kunde_id) },
+    { key: 'art', label: 'Art', type: 'select', required: true, options: [['', 'bitte wählen']].concat(VERTRAG_ARTEN.map(x => [x, x])) },
+    { key: 'beginn', label: 'Beginn', type: 'date', required: true },
+    { key: 'mindestlaufzeit_monate', label: 'Mindestlaufzeit (Monate)', type: 'number' },
+    { key: 'kuendigungsfrist_wert', label: 'Kündigungsfrist', type: 'number' },
+    { key: 'kuendigungsfrist_einheit', label: 'Einheit der Frist', type: 'select', options: [['Monate', 'Monate'], ['Wochen', 'Wochen'], ['Tage', 'Tage']], def: 'Monate' },
+    { key: 'verlaengerung_monate', label: 'Verlängert sich automatisch um (Monate, leer: endet)', type: 'number' },
+    { key: 'ende', label: 'Festes Ende (optional, sonst aus der Mindestlaufzeit)', type: 'date' },
+    { key: 'datei', label: 'Unterschriebener Vertrag (PDF)', type: 'file', accept: 'application/pdf,.pdf', full: true },
+    { key: 'notizen', label: 'Notizen', type: 'textarea', full: true },
+  ];
+  const dokFelder = d => [
+    { key: 'kunde_id', label: 'Kunde', type: 'select', required: true, options: kundenOpt(d.kunde_id) },
+    { key: 'titel', label: 'Titel (zum Beispiel Akkreditierung 2026)', required: true },
+    { key: 'datei', label: 'Datei (PDF)', type: 'file', accept: 'application/pdf,.pdf', full: true },
+    { key: 'notizen', label: 'Notizen', type: 'textarea', full: true },
+  ];
+  const aktiv = vertraege.filter(v => !v.archiviert);
+  view.innerHTML = head('Verträge und Dokumente', 'Fristen werden berechnet, ohne Gewähr: maßgeblich ist der Vertrag')
+    + `<div class="toolbar"><button class="btn primary" id="vNeu">Vertrag anlegen</button><button class="btn" id="dNeu">Dokument hochladen</button></div>
+    <div class="grid">
+      <div class="card" id="vListe"><h2>Verträge</h2>${aktiv.length ? `<table class="tbl karten"><thead><tr><th>Kunde</th><th>Art</th><th>Laufzeit</th><th>Frist</th><th>Datei</th></tr></thead><tbody>
+        ${aktiv.map(v => `<tr><td class="k-titel"><button type="button" class="linkbtn" data-vertrag="${v.id}"><b>${esc(kname(v.kunde_id))}</b></button></td>
+          <td class="k-kunde">${esc(v.art)}</td>
+          <td class="k-datum">ab ${datum(v.beginn)}${v.laufzeit_ende ? ` bis ${datum(v.laufzeit_ende)}` : ''}<br><span class="muted small">${esc(v.vertrag_status)}</span></td>
+          <td class="k-status">${fristBadge(v)}</td><td class="k-rest">${dateiKnoepfe('vertraege', v)}</td></tr>`).join('')}</tbody></table>`
+        : '<p class="muted">Noch keine Verträge.</p>'}
+        ${vertraege.length > aktiv.length ? `<p class="muted small">${vertraege.length - aktiv.length} archiviert, über Bearbeiten wiederherstellbar.</p>` : ''}</div>
+      <div class="card" id="dListe"><h2>Dokumente</h2>${dokumente.length ? `<table class="tbl karten"><thead><tr><th>Kunde</th><th>Titel</th><th>Hochgeladen</th><th>Datei</th></tr></thead><tbody>
+        ${dokumente.map(d => `<tr><td class="k-kunde">${esc(kname(d.kunde_id))}</td>
+          <td class="k-titel"><button type="button" class="linkbtn" data-dok="${d.id}"><b>${esc(d.titel)}</b></button>${d.datei_name ? `<br><span class="muted small">${esc(d.datei_name)}, ${groesse(d.groesse)}</span>` : ''}</td>
+          <td class="k-datum">${datum(d.hochgeladen_am)}</td><td class="k-rest">${dateiKnoepfe('dokumente', d)}</td></tr>`).join('')}</tbody></table>`
+        : '<p class="muted">Noch keine Dokumente.</p>'}</div>
+    </div>`;
+  $('#vNeu').addEventListener('click', () => editRecord('vertraege', 'Vertrag anlegen', vertragFelder({})));
+  $('#dNeu').addEventListener('click', () => editRecord('dokumente', 'Dokument hochladen', dokFelder({})));
+  $('#vListe').addEventListener('click', (ev) => {
+    const id = ev.target.closest('button')?.dataset.vertrag;
+    if (id) { const v = byId(vertraege, id); editRecord('vertraege', 'Vertrag bearbeiten', vertragFelder(v), { ...v, datei: v.datei_name }); }
+  });
+  $('#dListe').addEventListener('click', (ev) => {
+    const id = ev.target.closest('button')?.dataset.dok;
+    if (id) { const d = byId(dokumente, id); editRecord('dokumente', 'Dokument bearbeiten', dokFelder(d), { ...d, datei: d.datei_name }); }
   });
 };
