@@ -1,7 +1,7 @@
 # Studio-Tool (Arbeitstitel)
 
 **Zweck:** Internes Verwaltungstool für silasgrbwsk.fotografie: Aufträge, Zahlungen, Bildauslieferung, Verträge, Postfach, Kalender, Aufgaben. Einziger Nutzer: Silas.
-**Domain:** OFFEN (noch nicht festgelegt, dazu `www.`?)
+**Domain:** `hub.silasgrbwskfotografie.de` (Subdomain, kein `www.`). DNS bei netcup (CCP). Unter `silasgrbwskfotografie.de` läuft E-Mail (MX, SPF, DKIM über netcup-Webhosting): MX, TXT und `*._domainkey` nie ändern. Für das Tool gibt es nur den A-Eintrag `hub` auf `62.83.124.184`.
 **Technik:** Python (nur Standardbibliothek) und SQLite im Aufbau des Emden Tigers Hubs, eigener Code. Oberfläche HTML, CSS und JavaScript ohne Build-Schritt.
 **Repository:** OFFEN (Empfehlung: privat. Bei öffentlich: keine Zugangsdaten, keine privaten Links im Code)
 **Suchmaschinen:** `noindex`, weil rein intern.
@@ -121,7 +121,7 @@ Ein Fehler im Caddyfile legt beide Seiten lahm: vorher prüfen mit
 
 ### DNS
 
-- A-Eintrag der Domain (und ggf. `www`) auf `62.83.124.184`. Bei welchem Anbieter die Domain liegt: OFFEN.
+- A-Eintrag für `hub.silasgrbwskfotografie.de` auf `62.83.124.184`, eingetragen bei netcup (CCP, DNS-Verwaltung). Kein AAAA-Eintrag für `hub` (der VPS ist nur per IPv4 eingeplant).
 - Läuft unter der Domain schon E-Mail: **MX- und TXT-Einträge (SPF, DKIM, DMARC) nie ändern**, nur A/AAAA.
 - Erst wenn `getent hosts <domain>` auf dem Server die IP zeigt, kann Caddy ein Zertifikat holen.
 

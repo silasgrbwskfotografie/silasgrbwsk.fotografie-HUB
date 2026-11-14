@@ -1,0 +1,111 @@
+/* Studio-Tool: mobil zuerst. Ab 760 px Seitenleiste links, darunter Leiste oben und Tab-Leiste unten wie in einer App. */
+:root{
+  --ink:#16181d; --ink-2:#4b4f58; --ink-3:#868b95;
+  --bg:#f5f3ef; --card:#ffffff; --line:#e4e0d8;
+  --side:#16181d; --side-2:#23262d;
+  --accent:#9a7b3f; --accent-soft:#f4ecdc;
+  --ok:#1d7a46; --ok-soft:#e5f3ea; --warn:#a86400; --warn-soft:#fdf1dc; --bad:#b00020; --bad-soft:#fbe9ec;
+  --radius:12px;
+  --font:system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{font-family:var(--font);font-size:15px;line-height:1.45;color:var(--ink);background:var(--bg);-webkit-tap-highlight-color:transparent}
+a{color:var(--accent)}
+button,input,select,textarea{font:inherit;color:inherit}
+.muted{color:var(--ink-3)}
+.small{font-size:12.5px}
+.hidden{display:none!important}
+
+/* ---------- Handy (Standard) ---------- */
+#topbar{display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:40;height:calc(52px + env(safe-area-inset-top));
+  padding:env(safe-area-inset-top) 16px 0;background:rgba(22,24,29,.95);color:#fff;font-size:16px}
+#topbar .tb-logo{height:30px;width:auto;filter:invert(1)}
+#topbar b{margin-left:auto;font-size:15px;font-weight:600}
+#sidebar{position:fixed;top:0;bottom:0;left:0;z-index:60;width:min(290px,84vw);background:var(--side);color:#ddd;display:flex;flex-direction:column;
+  transform:translateX(-100%);transition:transform .22s ease;padding-top:env(safe-area-inset-top)}
+#navShade{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.45);opacity:0;pointer-events:none;transition:opacity .2s}
+body.nav-open #sidebar{transform:none}
+body.nav-open #navShade{opacity:1;pointer-events:auto}
+#main{padding-bottom:calc(72px + env(safe-area-inset-bottom))}
+#view{max-width:1180px;margin:0 auto;padding:18px 16px 32px}
+#tabbar{position:fixed;left:0;right:0;bottom:0;z-index:40;display:flex;background:rgba(255,255,255,.97);border-top:1px solid var(--line);
+  padding-bottom:env(safe-area-inset-bottom)}
+#tabbar a,#tabbar button{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 0 6px;font-size:11px;color:var(--ink-3);
+  text-decoration:none;background:none;border:0;cursor:pointer;min-width:0}
+#tabbar svg{width:24px;height:24px}
+#tabbar a.active{color:var(--accent)}
+
+/* Seitenleiste */
+.brand{padding:20px 18px 16px;border-bottom:1px solid #2a2d34}
+.brand-logo{display:block;width:100%;max-width:200px;height:auto;filter:invert(1)}   /* schwarzes Logo auf dunklem Grund hell */
+.brand-sub{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:#9a9ea7;margin-top:8px}
+#nav{padding:10px;overflow:auto;flex:1}
+.nav-group{font-size:10.5px;letter-spacing:1.6px;text-transform:uppercase;color:#757a84;margin:16px 10px 6px}
+#nav a{display:block;padding:10px 12px;border-radius:8px;color:#d2d4d8;text-decoration:none;margin:1px 0;border-left:3px solid transparent}
+#nav a:hover{background:var(--side-2);color:#fff}
+#nav a.active{background:var(--side-2);color:#fff;border-left-color:var(--accent)}
+.sidebar-foot{padding:12px 16px calc(12px + env(safe-area-inset-bottom));font-size:13px;color:#9a9ea7;border-top:1px solid #2a2d34;
+  display:flex;align-items:center;justify-content:space-between;gap:8px}
+.sidebar-foot button{background:none;border:1px solid #3a3e46;color:#c8cad0;border-radius:7px;padding:6px 10px;cursor:pointer;font-size:12.5px}
+.sidebar-foot button:hover{border-color:#777;color:#fff}
+
+/* ---------- PC ---------- */
+@media (min-width:760px){
+  body{display:flex}
+  #topbar,#tabbar,#navShade{display:none}
+  #sidebar{position:sticky;transform:none;width:236px;flex:none;height:100vh;transition:none}
+  #main{flex:1;min-width:0;height:100vh;overflow:auto;padding-bottom:0}
+  #view{padding:28px 32px 60px}
+}
+
+/* Inhalt */
+.page-head{margin-bottom:18px}
+h1{font-size:24px;margin:0;letter-spacing:-.2px}
+h1 small{display:block;font-size:13px;font-weight:400;color:var(--ink-3);margin-top:4px}
+h2{font-size:13px;margin:0 0 12px;text-transform:uppercase;letter-spacing:.7px;color:var(--ink-2)}
+.grid{display:grid;gap:14px}
+@media (min-width:900px){.g2{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px}
+.card p{margin:0 0 8px}
+.card.empty{text-align:left}
+.badge{display:inline-block;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:99px;background:var(--accent-soft);color:var(--accent);margin-bottom:8px}
+.badge.warn{background:var(--warn-soft);color:var(--warn);margin:0}
+.tbl{width:100%;border-collapse:collapse;margin-bottom:8px}
+.tbl th,.tbl td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+.tbl th{font-size:12px;color:var(--ink-3);font-weight:600}
+.tbl .num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+
+/* Formulare */
+.field{margin-bottom:14px}
+.field label{display:block;font-size:13px;font-weight:600;margin-bottom:5px;color:var(--ink-2)}
+.input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:9px;background:#fff;font-size:16px}
+.input:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 16px;border-radius:9px;border:1px solid var(--line);background:#fff;cursor:pointer;font-weight:600}
+.btn.primary{background:var(--ink);border-color:var(--ink);color:#fff}
+.btn.wide{width:100%;justify-content:center}
+.btn:disabled{opacity:.6;cursor:wait}
+.err{color:var(--bad);font-size:13.5px;min-height:20px;margin:10px 0 0}
+.toast{position:fixed;left:50%;bottom:calc(84px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:80;background:var(--ink);color:#fff;
+  padding:10px 16px;border-radius:9px;font-size:14px}
+
+/* Anmeldung */
+.auth-body{display:flex;align-items:center;justify-content:center;min-height:100vh;background:var(--side);padding:16px}
+.auth{width:min(380px,100%);background:#fff;border-radius:16px;padding:26px 22px}
+.auth-brand{text-align:center;margin-bottom:24px}
+.auth-logo{display:block;width:100%;max-width:260px;height:auto;margin:0 auto 10px}
+.auth-brand span{font-size:11.5px;letter-spacing:2.5px;text-transform:uppercase;color:var(--ink-3)}
+
+/* Sicherheit / Zwei-Faktor */
+.warnline{background:var(--warn-soft);color:var(--warn);border-radius:9px;padding:10px 12px;margin:0 0 12px}
+.badge.ok{background:var(--ok-soft);color:var(--ok);margin:0 0 0 6px;vertical-align:middle}
+.btn.sm{padding:5px 10px;font-size:13px;text-decoration:none;color:var(--ink)}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+.steps{line-height:1.7;padding-left:20px;margin:0 0 12px}
+.qr{display:block;width:max-content;max-width:100%;margin:8px 0;padding:8px;background:#fff;border:1px solid var(--line);border-radius:8px}
+.qr svg{display:block;max-width:100%;height:auto}
+.secret{font-size:16px;letter-spacing:1px;user-select:all;word-break:break-all}
+.codes{font-size:16px;line-height:1.8;background:var(--bg);padding:12px 16px;border-radius:9px;columns:2;margin:0 0 10px}
+#tfCard{max-width:620px}
+.auth-step{margin:0 0 6px}
+.center{text-align:center;margin:14px 0 0}

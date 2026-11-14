@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>Anmelden · Studio-Tool</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="auth-body">
+<form class="auth" id="loginForm" method="post" action="/auth/login" novalidate>
+  <div class="auth-brand">
+    <img class="auth-logo" src="/static/logo.png" alt="silasgrbwsk. Fotografie">
+    <span>Studio-Tool</span>
+  </div>
+  <div id="s1">
+    <div class="field">
+      <label for="u">Benutzername</label>
+      <input class="input" id="u" name="username" autocomplete="username" autocapitalize="none" required autofocus>
+    </div>
+    <div class="field">
+      <label for="p">Passwort</label>
+      <input class="input" id="p" name="password" type="password" autocomplete="current-password" required>
+    </div>
+    <button class="btn primary wide" id="loginBtn">Anmelden</button>
+  </div>
+  <div id="s2" hidden>
+    <p class="auth-step"><b>Zwei-Faktor-Anmeldung</b></p>
+    <p class="muted small">Gib den 6-stelligen Code aus deiner Authenticator-App ein. Handy nicht zur Hand? Dann einen deiner Wiederherstellungscodes.</p>
+    <div class="field">
+      <label for="c">Code</label>
+      <input class="input" id="c" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="20" disabled>
+    </div>
+    <button class="btn primary wide" id="codeBtn">Bestätigen</button>
+    <p class="small center"><a href="/login">Abbrechen</a></p>
+  </div>
+  <p class="err" id="err" role="alert"></p>
+</form>
+<script src="/static/login.js"></script>
+</body>
+</html>

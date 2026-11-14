@@ -1,0 +1,1137 @@
+"""
+Studio-Tool silasgrbwsk.fotografie
+Interne Arbeitsoberfläche: Aufträge, Zahlungen, Bildauslieferung, Verträge, später Postfach, Kalender und Aufgaben.
+Aufbau wie beim Emden Tigers Hub: ein Python-Prozess, nur Standardbibliothek, SQLite unter /data.
+
+Lokal:            python server.py          (http://127.0.0.1:3000)
+Benutzer anlegen: python server.py adduser <name>
+Passwort setzen:  python server.py passwd <name>
+2FA zurücksetzen: python server.py 2fa-reset <name>   (Notfall: Handy weg und keine Wiederherstellungscodes mehr)
+
+Konfiguration über Umgebungsvariablen (auf dem Server aus der .env):
+  STUDIO_HOST            Adresse, an die der Server bindet (Standard 127.0.0.1, im Container 0.0.0.0)
+  STUDIO_PORT            Port (Standard 3000)
+  STUDIO_DATA            Datenordner (Standard: Ordner "data" neben dieser Datei)
+  STUDIO_SECURE_COOKIES  1 = Login-Cookie nur über HTTPS (hinter Caddy immer 1)
+  STUDIO_TRUST_PROXY     1 = Client-IP aus X-Forwarded-For übernehmen (nur hinter Caddy)
+  DOMAIN                 öffentliche Adresse ohne https://, Links werden nur daraus gebaut
+  STUDIO_ADMIN_USER      Benutzername des ersten Admins
+  STUDIO_ADMIN_PASSWORD  Passwort des ersten Admins (nur genutzt, solange es keinen Benutzer gibt)
+  STUDIO_RESET_PASSWORD  1 = Passwort von STUDIO_ADMIN_USER beim Start auf STUDIO_ADMIN_PASSWORD zurücksetzen
+"""
+
+import base64
+import contextlib
+import getpass
+import hashlib
+import hmac
+import json
+import mimetypes
+import os
+import re
+import secrets
+import sqlite3
+import sys
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+from zoneinfo import ZoneInfo
+
+VERSION = "0.1"
+APP_NAME = "Studio-Tool"
+ENV = os.environ.get
+HOST = ENV("STUDIO_HOST", "127.0.0.1")
+PORT = int(ENV("STUDIO_PORT", "3000"))
+SECURE_COOKIES = ENV("STUDIO_SECURE_COOKIES") == "1"
+TRUST_PROXY = ENV("STUDIO_TRUST_PROXY") == "1"
+DOMAIN = (ENV("DOMAIN") or "").strip().strip("/")
+SITE_URL = f"https://{DOMAIN}" if DOMAIN else f"http://127.0.0.1:{PORT}"
+TZ = ZoneInfo("Europe/Berlin")
+MAX_JSON = 2 * 1024 * 1024
+SESSION_DAYS = 30
+COOKIE = "studio_session"
+CSRF_HEADER = "X-Studio"          # jede schreibende Anfrage braucht "X-Studio: 1" (fremde Seiten können ihn nicht setzen)
+
+BASE = Path(__file__).resolve().parent
+STATIC = BASE / "static"
+DATA = Path(ENV("STUDIO_DATA") or (BASE / "data")).resolve()
+UPLOADS = DATA / "uploads"
+BACKUPS = DATA / "backups"
+DB_PATH = DATA / "studio.db"
+
+# ---------------------------------------------------------------------------
+# Datenbank-Schema
+# Jede Tabelle: Spaltenname -> SQL-Typ. "id" wird automatisch angelegt.
+# Neue Spalten hier ergänzen, sie werden beim Start zur bestehenden Datenbank hinzugefügt.
+# Geldbeträge immer als ganze Cent (Spalten *_cent), Datum als JJJJ-MM-TT, Zeitpunkte als ISO mit Zeitzone.
+# ---------------------------------------------------------------------------
+STATUS_AUFTRAG = ("Angefragt", "Bestätigt", "Fotografiert", "Geliefert", "Abgeschlossen", "Abgesagt")
+STATUS_ZAHLUNG = ("Offen", "Bezahlt", "Erlassen")
+ZAHLARTEN = ("Bar", "Überweisung", "PayPal")
+KUNDEN_TYPEN = ("Verein", "Sparte", "Einzelperson")
+LINK_TYPEN = ("Picdrop", "pCloud", "Sonstiges")
+VERTRAG_ARTEN = ("Saisonvertrag", "Einwilligungs- und Nutzungsvereinbarung", "Sponsoring")
+
+TABLES = {
+    # ---- Kern: der Auftrag ist der Mittelpunkt ----
+    "kunden": {
+        "name": "TEXT NOT NULL",
+        "typ": "TEXT DEFAULT 'Verein'",                  # KUNDEN_TYPEN
+        "parent_id": "INTEGER REFERENCES kunden(id)",    # Sparte gehört zu Verein
+        "notizen": "TEXT",
+        "archiviert": "INTEGER DEFAULT 0",
+        "erstellt_am": "TEXT",
+        "geaendert_am": "TEXT",
+    },
+    "kontakte": {                                        # Ansprechperson oder Zahler
+        "kunde_id": "INTEGER REFERENCES kunden(id)",
+        "name": "TEXT",
+        "rolle": "TEXT",
+        "telefon": "TEXT",
+        "email": "TEXT",
+        "instagram": "TEXT",
+        "notizen": "TEXT",
+        "anonymisiert": "INTEGER DEFAULT 0",             # Löschwunsch: Daten leeren, Umsätze bleiben
+        "erstellt_am": "TEXT",
+        "geaendert_am": "TEXT",
+    },
+    "pakete": {                                          # Preisvorlage
+        "name": "TEXT NOT NULL",
+        "grundpreis_cent": "INTEGER NOT NULL DEFAULT 0",
+        "inkl_spieler": "INTEGER DEFAULT 0",             # 0 = keine Spielerstaffel
+        "zusatzspieler_cent": "INTEGER DEFAULT 0",
+        "finom_text": "TEXT",                            # Leistungstext für die Rechnung in Finom
+        "aktiv": "INTEGER DEFAULT 1",
+        "sort": "INTEGER DEFAULT 0",
+    },
+    "auftraege": {                                       # ein Spiel oder Shooting
+        "kunde_id": "INTEGER REFERENCES kunden(id)",
+        "paket_id": "INTEGER REFERENCES pakete(id)",
+        "serie": "TEXT",                                 # gemeinsame Kennung bei Serien-Anlage
+        "datum": "TEXT",
+        "uhrzeit": "TEXT",
+        "ort": "TEXT",
+        "sportart": "TEXT",
+        "begegnung": "TEXT",
+        "status": "TEXT DEFAULT 'Angefragt'",            # STATUS_AUFTRAG
+        "km": "INTEGER DEFAULT 0",                       # einfache Strecke ab Emden
+        "spieler": "INTEGER DEFAULT 0",
+        # beim Anlegen festgeschrieben, spätere Paketpreise ändern alte Aufträge nicht
+        "grundpreis_cent": "INTEGER DEFAULT 0",
+        "zusatzspieler_cent": "INTEGER DEFAULT 0",
+        "anfahrt_cent": "INTEGER DEFAULT 0",
+        "betrag_cent": "INTEGER DEFAULT 0",
+        "betrag_manuell": "INTEGER DEFAULT 0",           # 1 = Betrag von Hand überschrieben
+        "lieferfrist": "TEXT",
+        "notizen": "TEXT",
+        "archiviert": "INTEGER DEFAULT 0",
+        "erstellt_am": "TEXT",
+        "geaendert_am": "TEXT",
+    },
+    "zahlungen": {
+        "auftrag_id": "INTEGER REFERENCES auftraege(id)",
+        "zahler_id": "INTEGER REFERENCES kontakte(id)",
+        "betrag_cent": "INTEGER DEFAULT 0",
+        "status": "TEXT DEFAULT 'Offen'",                # STATUS_ZAHLUNG
+        "zahlart": "TEXT",                               # ZAHLARTEN
+        "zahldatum": "TEXT",
+        "finom_abgerechnet": "INTEGER DEFAULT 0",
+        "finom_rechnungsnr": "TEXT",
+        "notizen": "TEXT",
+        "erstellt_am": "TEXT",
+        "geaendert_am": "TEXT",
+    },
+    "lieferlinks": {                                     # Galerie-Link zum Auftrag (Bilder selbst liegen bei Picdrop/pCloud)
+        "auftrag_id": "INTEGER REFERENCES auftraege(id)",
+        "typ": "TEXT DEFAULT 'Picdrop'",                 # LINK_TYPEN
+        "url": "TEXT",
+        "empfaenger": "TEXT",
+        "erstellt_am": "TEXT",
+        "laeuft_ab_am": "TEXT",
+        "hinweis": "TEXT",
+    },
+    "vertraege": {
+        "kunde_id": "INTEGER REFERENCES kunden(id)",
+        "art": "TEXT",                                   # VERTRAG_ARTEN
+        "beginn": "TEXT",
+        "mindestlaufzeit_monate": "INTEGER",
+        "kuendigungsfrist_wert": "INTEGER",
+        "kuendigungsfrist_einheit": "TEXT DEFAULT 'Monate'",   # Tage / Wochen / Monate
+        "ende": "TEXT",
+        "datei": "TEXT",                                 # zufälliger Dateiname unter uploads/
+        "datei_name": "TEXT",                            # ursprünglicher Name für den Download
+        "notizen": "TEXT",
+        "archiviert": "INTEGER DEFAULT 0",
+        "erstellt_am": "TEXT",
+        "geaendert_am": "TEXT",
+    },
+    "dokumente": {                                       # freie Ablage je Kunde (z. B. Akkreditierungen)
+        "kunde_id": "INTEGER REFERENCES kunden(id)",
+        "titel": "TEXT",
+        "datei": "TEXT",
+        "datei_name": "TEXT",
+        "groesse": "INTEGER",
+        "notizen": "TEXT",
+        "hochgeladen_am": "TEXT",
+    },
+    # ---- Erweiterung: Postfach, Kalender, Aufgaben, Push ----
+    "mailkonten": {                                      # wie user_mail im Hub, Passwort liegt in secrets ("mailkonto:<id>")
+        "name": "TEXT",
+        "adresse": "TEXT",
+        "smtp_host": "TEXT",
+        "smtp_port": "INTEGER DEFAULT 465",
+        "imap_host": "TEXT",
+        "imap_port": "INTEGER DEFAULT 993",
+        "benutzer": "TEXT",
+        "signatur": "TEXT",
+        "aktiv": "INTEGER DEFAULT 1",
+        "sort": "INTEGER DEFAULT 0",
+    },
+    "mail_eingang": {                                    # Stand des Hintergrund-Abrufs, wie pf_inbox im Hub
+        "konto_id": "INTEGER REFERENCES mailkonten(id)",
+        "uidvalidity": "INTEGER",
+        "uid": "INTEGER",
+        "message_id": "TEXT",
+        "betreff": "TEXT",
+        "absender": "TEXT",
+        "status": "TEXT DEFAULT 'neu'",                  # neu / erledigt
+        "erkannt_am": "TEXT",
+        "erledigt_am": "TEXT",
+    },
+    "mail_verweise": {                                   # nur der Verweis, nie die Mail selbst
+        "konto_id": "INTEGER REFERENCES mailkonten(id)",
+        "ordner": "TEXT",
+        "message_id": "TEXT",
+        "betreff": "TEXT",
+        "absender": "TEXT",
+        "kunde_id": "INTEGER REFERENCES kunden(id)",
+        "auftrag_id": "INTEGER REFERENCES auftraege(id)",
+        "erstellt_am": "TEXT",
+    },
+    "termine": {
+        "titel": "TEXT",
+        "beginn": "TEXT",
+        "ende": "TEXT",
+        "ganztaegig": "INTEGER DEFAULT 0",
+        "ort": "TEXT",
+        "art": "TEXT",                                   # Besprechung, Vorbereitung, privat geblockt ...
+        "wiederholung": "TEXT",
+        "erinnerung_min": "INTEGER",
+        "kunde_id": "INTEGER REFERENCES kunden(id)",
+        "auftrag_id": "INTEGER REFERENCES auftraege(id)",
+        "notizen": "TEXT",
+        "erstellt_am": "TEXT",
+        "geaendert_am": "TEXT",
+    },
+    "aufgaben": {
+        "titel": "TEXT",
+        "faellig": "TEXT",
+        "prioritaet": "TEXT DEFAULT 'Mittel'",           # Hoch / Mittel / Niedrig
+        "status": "TEXT DEFAULT 'Offen'",                # Offen / In Arbeit / Erledigt
+        "wiederholung": "TEXT",
+        "kunde_id": "INTEGER REFERENCES kunden(id)",
+        "auftrag_id": "INTEGER REFERENCES auftraege(id)",
+        "mail_verweis_id": "INTEGER REFERENCES mail_verweise(id)",
+        "notizen": "TEXT",
+        "sort": "INTEGER DEFAULT 0",
+        "erledigt_am": "TEXT",
+        "erstellt_am": "TEXT",
+        "geaendert_am": "TEXT",
+    },
+    "push_abos": {                                       # angemeldetes Gerät
+        "endpoint": "TEXT",                              # eindeutig über ux_push_endpoint
+        "p256dh": "TEXT",
+        "auth": "TEXT",
+        "geraet": "TEXT",
+        "angelegt_am": "TEXT",
+    },
+}
+
+INDEXES = (
+    "CREATE INDEX IF NOT EXISTS ix_auftraege_datum ON auftraege(datum)",
+    "CREATE INDEX IF NOT EXISTS ix_auftraege_kunde ON auftraege(kunde_id)",
+    "CREATE INDEX IF NOT EXISTS ix_zahlungen_auftrag ON zahlungen(auftrag_id)",
+    "CREATE INDEX IF NOT EXISTS ix_lieferlinks_auftrag ON lieferlinks(auftrag_id)",
+    "CREATE INDEX IF NOT EXISTS ix_kontakte_kunde ON kontakte(kunde_id)",
+    "CREATE INDEX IF NOT EXISTS ix_vertraege_kunde ON vertraege(kunde_id)",
+    "CREATE INDEX IF NOT EXISTS ix_mail_eingang_konto ON mail_eingang(konto_id, uid)",
+    "CREATE INDEX IF NOT EXISTS ix_termine_beginn ON termine(beginn)",
+    "CREATE INDEX IF NOT EXISTS ix_aufgaben_faellig ON aufgaben(faellig)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_push_endpoint ON push_abos(endpoint)",
+)
+
+# Startwerte der Einstellungen (Seed). Geldwerte in Cent. Leer heißt: noch nicht festgelegt.
+DEFAULT_SETTINGS = {
+    "anfahrt_frei_km": "10",          # die ersten 10 km ab Emden frei
+    "anfahrt_cent_je_km": "30",       # danach 0,30 € je km
+    "lieferfrist_tage": "5",          # Galerie spätestens 5 Tage nach dem Spiel
+    "picdrop_tage": "30",             # Picdrop-Link läuft nach 30 Tagen ab
+    "umsatzgrenze_cent": "",          # OFFEN: Kleinunternehmergrenze, Wert von Silas (mit Steuerberatung abgleichen)
+    "twofa_pflicht": "1",             # Zwei-Faktor-Anmeldung ist Pflicht (Entscheidung von Silas)
+}
+
+# Startpakete (Seed), Preise in Cent. Finom-Leistungstext bleibt leer, bis Silas ihn einträgt.
+SEED_PAKETE = (
+    {"name": "Basic", "grundpreis_cent": 3000, "inkl_spieler": 0, "zusatzspieler_cent": 0, "sort": 1},
+    {"name": "Pro", "grundpreis_cent": 4500, "inkl_spieler": 0, "zusatzspieler_cent": 0, "sort": 2},
+    {"name": "Spielershooting", "grundpreis_cent": 6000, "inkl_spieler": 25, "zusatzspieler_cent": 90, "sort": 3},
+    {"name": "Saisonspiel HSG Emden", "grundpreis_cent": 3500, "inkl_spieler": 0, "zusatzspieler_cent": 0, "sort": 4},
+)
+
+DB_LOCK = threading.RLock()
+
+
+def now_iso():
+    return datetime.now(TZ).isoformat(timespec="seconds")
+
+
+@contextlib.contextmanager
+def db():
+    """Verbindung öffnen, am Ende committen (bzw. bei Fehler zurückrollen) und schließen."""
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 15000")
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+
+def init_db():
+    DATA.mkdir(parents=True, exist_ok=True)
+    UPLOADS.mkdir(exist_ok=True)
+    BACKUPS.mkdir(exist_ok=True)
+    with db() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        # Interne Tabellen: bewusst NICHT in TABLES, damit sie nie über eine allgemeine API erreichbar sind
+        conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE COLLATE NOCASE, "
+                     "pw_hash TEXT, display_name TEXT, active INTEGER DEFAULT 1, fail_count INTEGER DEFAULT 0, fail_first REAL, "
+                     "locked_until REAL, created_at TEXT, last_login TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER REFERENCES users(id), "
+                     "expires REAL, created_at TEXT, ip TEXT, user_agent TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS user_2fa (user_id INTEGER PRIMARY KEY REFERENCES users(id), secret TEXT, "
+                     "enabled INTEGER DEFAULT 0, pending_secret TEXT, pending_expires REAL, last_step INTEGER DEFAULT 0, "
+                     "recovery TEXT, enabled_at TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS secrets (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, user_id INTEGER, "
+                     "user_name TEXT, action TEXT, table_name TEXT, record_id INTEGER, label TEXT, details TEXT)")
+        for table, cols in TABLES.items():
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for col, typ in cols.items():
+                if col not in have:
+                    # NOT NULL ohne Default lässt sich nicht nachträglich anfügen
+                    add = typ.replace("NOT NULL", "") if "DEFAULT" not in typ else typ
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {add}")
+        for sql in INDEXES:
+            conn.execute(sql)
+        seed(conn)
+
+
+def seed(conn):
+    """Startdaten: Einstellungen und Pakete. Läuft bei jedem Start, ändert aber nie vorhandene Werte."""
+    for k, v in DEFAULT_SETTINGS.items():
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+    if not conn.execute("SELECT 1 FROM settings WHERE key='seed_pakete'").fetchone():
+        if not conn.execute("SELECT COUNT(*) FROM pakete").fetchone()[0]:
+            for p in SEED_PAKETE:
+                conn.execute("INSERT INTO pakete (name, grundpreis_cent, inkl_spieler, zusatzspieler_cent, finom_text, aktiv, sort) "
+                             "VALUES (?, ?, ?, ?, '', 1, ?)",
+                             (p["name"], p["grundpreis_cent"], p["inkl_spieler"], p["zusatzspieler_cent"], p["sort"]))
+        conn.execute("INSERT INTO settings (key, value) VALUES ('seed_pakete', ?)", (now_iso(),))
+
+
+def row_dict(r):
+    return {k: r[k] for k in r.keys()}
+
+
+def get_setting(conn, key):
+    r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else DEFAULT_SETTINGS.get(key, "")
+
+
+def set_setting(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+
+
+def secret_get(conn, key):
+    r = conn.execute("SELECT value FROM secrets WHERE key=?", (key,)).fetchone()
+    return r["value"] if r and r["value"] is not None else ""
+
+
+def secret_set(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO secrets (key, value) VALUES (?, ?)", (key, value))
+
+
+def audit(conn, user, action, table="", rid=None, label="", details=None):
+    """user: angemeldeter Benutzer (dict) oder ein Name wie „System“ für Aktionen ohne Login."""
+    if isinstance(user, dict):
+        uid, name = user.get("id"), user.get("display_name") or user.get("username") or "?"
+    else:
+        uid, name = None, user or "System"
+    conn.execute("INSERT INTO audit_log (time, user_id, user_name, action, table_name, record_id, label, details) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (now_iso(), uid, name, action, table, rid, (label or "")[:120],
+                  json.dumps(details, ensure_ascii=False)[:6000] if details else ""))
+
+
+# ---------------------------------------------------------------------------
+# Anzeige-Hilfen (Euro, Datum TT.MM.JJJJ)
+# ---------------------------------------------------------------------------
+def eur_text(cent):
+    """2 -> '0,02 €', 672000 -> '6.720,00 €'"""
+    cent = int(cent or 0)
+    sign = "-" if cent < 0 else ""
+    euro, rest = divmod(abs(cent), 100)
+    return f"{sign}{euro:,}".replace(",", ".") + f",{rest:02d} €"
+
+
+def datum_text(iso):
+    """'2026-11-01' -> '01.11.2026', ungültig -> ''"""
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", iso or "")
+    return f"{m.group(3)}.{m.group(2)}.{m.group(1)}" if m else ""
+
+
+# ---------------------------------------------------------------------------
+# Benutzer, Passwörter, Sitzungen (wie im Hub)
+# ---------------------------------------------------------------------------
+def hash_pw(pw):
+    salt = secrets.token_bytes(16)
+    h = hashlib.scrypt(pw.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${h.hex()}"
+
+
+def check_pw(pw, stored):
+    try:
+        algo, salt, h = (stored or "").split("$")
+        if algo != "scrypt":
+            return False
+        calc = hashlib.scrypt(pw.encode("utf-8"), salt=bytes.fromhex(salt), n=2 ** 14, r=8, p=1, dklen=32)
+        return hmac.compare_digest(calc.hex(), h)
+    except Exception:  # noqa
+        return False
+
+
+def pw_problem(pw):
+    if len(pw or "") < 10:
+        return "Das Passwort muss mindestens 10 Zeichen lang sein."
+    return ""
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def check_username(username):
+    username = (username or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._@-]{2,40}", username):
+        raise ValueError("Benutzername: 2 bis 40 Zeichen, nur Buchstaben, Zahlen und . _ - @")
+    return username
+
+
+def user_count():
+    with db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def create_user(username, password, display_name=""):
+    username = check_username(username)
+    prob = pw_problem(password)
+    if prob:
+        raise ValueError(prob)
+    with db() as conn:
+        if conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+            raise ValueError("Diesen Benutzernamen gibt es schon.")
+        uid = conn.execute("INSERT INTO users (username, pw_hash, display_name, active, created_at) VALUES (?, ?, ?, 1, ?)",
+                           (username, hash_pw(password), display_name or username, now_iso())).lastrowid
+        audit(conn, "System", "Konto angelegt", "users", uid, username)
+    return uid
+
+
+def set_password(username, password):
+    prob = pw_problem(password)
+    if prob:
+        raise ValueError(prob)
+    with db() as conn:
+        row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if not row:
+            raise ValueError("Diesen Benutzer gibt es nicht.")
+        conn.execute("UPDATE users SET pw_hash=?, active=1, fail_count=0, locked_until=NULL WHERE id=?", (hash_pw(password), row["id"]))
+        conn.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
+        audit(conn, "System", "Passwort gesetzt", "users", row["id"], username)
+
+
+def bootstrap_admin():
+    user = (ENV("STUDIO_ADMIN_USER") or "").strip()
+    pw = ENV("STUDIO_ADMIN_PASSWORD") or ""
+    if not user or not pw:
+        return
+    try:
+        with db() as conn:
+            exists = conn.execute("SELECT 1 FROM users WHERE username=?", (user,)).fetchone()
+            count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if exists and ENV("STUDIO_RESET_PASSWORD") == "1":
+            set_password(user, pw)
+            print(f"Passwort für {user} wurde zurückgesetzt. STUDIO_RESET_PASSWORD wieder auf 0 stellen.")
+        elif not count:
+            create_user(user, pw)
+            print(f"Admin-Benutzer {user} wurde angelegt.")
+    except ValueError as e:
+        print("Admin-Benutzer konnte nicht angelegt werden:", e)
+
+
+# Sperren: 5 Fehlversuche je Konto -> 15 Minuten gesperrt. Zusätzlich je IP höchstens 20 Fehlversuche in 15 Minuten.
+# Unbekannte Benutzernamen werden genauso gezählt, damit die Antwort nichts über vorhandene Konten verrät.
+ACCOUNT_FAIL_MAX = 5
+ACCOUNT_LOCK_MINUTES = 15
+IP_FAIL_MAX = 20
+FAILED_LOCK = threading.Lock()
+FAILED_IPS = {}           # IP -> [Zeitpunkte]
+GHOST_FAILS = {}          # unbekannter Benutzername (klein) -> [Anzahl, erster Fehlversuch, gesperrt bis]
+DUMMY_PW_HASH = None
+
+
+def dummy_check_pw(pw):
+    """Gleiche Rechenzeit für unbekannte Benutzernamen."""
+    global DUMMY_PW_HASH
+    if DUMMY_PW_HASH is None:
+        DUMMY_PW_HASH = hash_pw(secrets.token_hex(8))
+    check_pw(pw, DUMMY_PW_HASH)
+
+
+def ip_blocked(ip):
+    with FAILED_LOCK:
+        now = time.time()
+        hits = [t for t in FAILED_IPS.get(ip, []) if now - t < ACCOUNT_LOCK_MINUTES * 60]
+        FAILED_IPS[ip] = hits
+        return len(hits) >= IP_FAIL_MAX
+
+
+def ip_failed(ip):
+    with FAILED_LOCK:
+        FAILED_IPS.setdefault(ip, []).append(time.time())
+
+
+def account_locked(u, username):
+    now = time.time()
+    if u is None:
+        with FAILED_LOCK:
+            g = GHOST_FAILS.get((username or "").lower())
+            return bool(g and g[2] > now)
+    return bool(u["locked_until"] and u["locked_until"] > now)
+
+
+def account_failed(conn, u, username):
+    """Fehlversuch zählen, beim Erreichen der Grenze sperren. Gibt True zurück, wenn jetzt gesperrt."""
+    now = time.time()
+    window = ACCOUNT_LOCK_MINUTES * 60
+    if u is None:
+        with FAILED_LOCK:
+            if len(GHOST_FAILS) > 5000:
+                GHOST_FAILS.clear()
+            key = (username or "").lower()
+            g = GHOST_FAILS.get(key)
+            if not g or now - g[1] > window:
+                g = [0, now, 0]
+            g[0] += 1
+            if g[0] >= ACCOUNT_FAIL_MAX:
+                g[2] = now + window
+            GHOST_FAILS[key] = g
+            return g[2] > now
+    first = u["fail_first"] or 0
+    count = (u["fail_count"] or 0) if now - first <= window else 0
+    if not count:
+        first = now
+    count += 1
+    locked = now + window if count >= ACCOUNT_FAIL_MAX else None
+    conn.execute("UPDATE users SET fail_count=?, fail_first=?, locked_until=? WHERE id=?",
+                 (0 if locked else count, first, locked, u["id"]))
+    if locked:
+        audit(conn, "Anmeldung", "Konto gesperrt", "users", u["id"], u["username"], {"Minuten": ACCOUNT_LOCK_MINUTES})
+    return bool(locked)
+
+
+def account_ok(conn, uid):
+    conn.execute("UPDATE users SET fail_count=0, fail_first=NULL, locked_until=NULL WHERE id=?", (uid,))
+
+
+# ---------------------------------------------------------------------------
+# Zwei-Faktor-Anmeldung (TOTP nach RFC 6238, wie im Hub): Code aus einer Authenticator-App,
+# dazu 10 Wiederherstellungscodes, die nur als Hash gespeichert werden.
+# ---------------------------------------------------------------------------
+TOTP_ISSUER = "Studio-Tool"
+RECOVERY_COUNT = 10
+RECOVERY_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+TWOFA_TICKET_MINUTES = 5
+TWOFA_TICKETS = {}        # Hash des Zwischen-Tickets -> {"uid", "expires", "tries"} (Passwort stimmt, Code fehlt noch)
+
+
+def totp_code(secret_b32, step, digits=6):
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
+    mac = hmac.new(key, step.to_bytes(8, "big"), hashlib.sha1).digest()
+    off = mac[-1] & 0x0F
+    return f"{(int.from_bytes(mac[off:off + 4], 'big') & 0x7FFFFFFF) % (10 ** digits):0{digits}d}"
+
+
+def totp_match(secret_b32, code, last_step=0, now=None):
+    """Passenden Zeitschritt zurückgeben (30 Sekunden Abweichung erlaubt), sonst 0. Schon benutzte Codes zählen nicht."""
+    code = re.sub(r"\s", "", str(code or ""))
+    if not re.fullmatch(r"\d{6}", code) or not secret_b32:
+        return 0
+    t = int((now if now is not None else time.time()) // 30)
+    for step in (t - 1, t, t + 1):
+        if step > (last_step or 0) and hmac.compare_digest(totp_code(secret_b32, step), code):
+            return step
+    return 0
+
+
+def totp_uri(secret_b32, username):
+    from urllib.parse import quote
+    label = quote(f"{TOTP_ISSUER}:{username}")
+    return f"otpauth://totp/{label}?secret={secret_b32}&issuer={quote(TOTP_ISSUER)}&algorithm=SHA1&digits=6&period=30"
+
+
+def recovery_norm(code):
+    return re.sub(r"[^a-z0-9]", "", str(code or "").lower())
+
+
+def recovery_new():
+    """Neue Codes (Klartext für die einmalige Anzeige) und ihre Hashes (zum Speichern)."""
+    codes = []
+    for _ in range(RECOVERY_COUNT):
+        c = "".join(secrets.choice(RECOVERY_ALPHABET) for _ in range(10))
+        codes.append(f"{c[:5]}-{c[5:]}")
+    return codes, [token_hash(recovery_norm(c)) for c in codes]
+
+
+def twofa_row(conn, uid):
+    return conn.execute("SELECT * FROM user_2fa WHERE user_id=?", (uid,)).fetchone()
+
+
+def twofa_enabled(conn, uid):
+    r = twofa_row(conn, uid)
+    return bool(r and r["enabled"] and r["secret"])
+
+
+def twofa_required(conn):
+    return get_setting(conn, "twofa_pflicht") == "1"
+
+
+def twofa_check(conn, uid, code):
+    """Code aus der App oder Wiederherstellungscode prüfen. Rückgabe: "totp", "recovery" oder ""."""
+    r = twofa_row(conn, uid)
+    if not r or not r["enabled"]:
+        return ""
+    step = totp_match(r["secret"], code, r["last_step"] or 0)
+    if step:
+        conn.execute("UPDATE user_2fa SET last_step=? WHERE user_id=?", (step, uid))
+        return "totp"
+    norm = recovery_norm(code)
+    if len(norm) == 10:
+        hashes = json.loads(r["recovery"] or "[]")
+        h = token_hash(norm)
+        for x in hashes:
+            if hmac.compare_digest(x, h):
+                hashes.remove(x)
+                conn.execute("UPDATE user_2fa SET recovery=? WHERE user_id=?", (json.dumps(hashes), uid))
+                return "recovery"
+    return ""
+
+
+def twofa_ticket_new(uid):
+    tok = secrets.token_urlsafe(32)
+    with FAILED_LOCK:
+        now = time.time()
+        for k in [k for k, v in TWOFA_TICKETS.items() if v["expires"] < now]:
+            TWOFA_TICKETS.pop(k, None)
+        TWOFA_TICKETS[token_hash(tok)] = {"uid": uid, "expires": now + TWOFA_TICKET_MINUTES * 60, "tries": 0}
+    return tok
+
+
+def twofa_reset(username):
+    with db() as conn:
+        row = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if not row:
+            raise ValueError("Diesen Benutzer gibt es nicht.")
+        conn.execute("DELETE FROM user_2fa WHERE user_id=?", (row["id"],))
+        conn.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
+        audit(conn, "System", "Zwei-Faktor-Anmeldung zurückgesetzt", "users", row["id"], username)
+
+
+class _Discard:
+    """Bei HEAD-Anfragen: Inhalt verwerfen, Leeren und Schließen an die echte Verbindung weitergeben."""
+    def __init__(self, real):
+        self.real = real
+
+    def write(self, data):
+        return len(data)
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+class PayloadTooLarge(Exception):
+    pass
+
+
+# Öffentlich erreichbare Dateien (Anmeldeseite). Alles andere unter /static nur mit Sitzung.
+PUBLIC_STATIC = {"style.css", "login.js", "icon.svg", "logo.png"}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "StudioTool/" + VERSION
+    sys_version = ""
+    timeout = 60
+
+    def log_message(self, fmt, *args):  # ruhige Konsole
+        if "--verbose" in sys.argv:
+            super().log_message(fmt, *args)
+
+    # -- Antworten --------------------------------------------------------
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
+        # Nur eigene Skripte, Stile und Bilder. Keine Inline-Skripte, keine fremden Quellen.
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+                                                    "connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; "
+                                                    "frame-ancestors 'none'")
+        super().end_headers()
+        if getattr(self, "head_only", False):   # HEAD: Kopfzeilen wie bei GET, aber ohne Inhalt
+            self.wfile = _Discard(self.wfile)
+
+    def send_json(self, obj, status=200, headers=None):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_file(self, path: Path):
+        if not path.is_file():
+            return self.send_error(404)
+        ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        if path.suffix == ".js":
+            ctype = "text/javascript"
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype + ("; charset=utf-8" if ctype.startswith("text/") else ""))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def serve_under(self, root: Path, rest):
+        target = (root / "/".join(rest)).resolve()
+        if root.resolve() not in target.parents:
+            return self.send_error(403)
+        return self.send_file(target)
+
+    def redirect(self, to, cookie=None):
+        self.send_response(302)
+        self.send_header("Location", to)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise PayloadTooLarge()
+        if length > MAX_JSON or length < 0:
+            raise PayloadTooLarge()
+        raw = self.rfile.read(length) if length else b""
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw else {}
+        except (ValueError, UnicodeDecodeError):
+            raise BadRequest("Ungültige Daten")
+        if not isinstance(data, dict):
+            raise BadRequest("Ungültige Daten")
+        return data
+
+    def parts(self):
+        return [unquote(p) for p in urlparse(self.path).path.strip("/").split("/") if p]
+
+    # -- Anfragende Person ------------------------------------------------
+    def client_ip(self):
+        if TRUST_PROXY:   # nur hinter Caddy: Caddy setzt X-Forwarded-For selbst
+            fwd = self.headers.get("X-Forwarded-For", "")
+            if fwd:
+                return fwd.split(",")[0].strip()[:64]
+        return self.client_address[0]
+
+    def session_token(self):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == COOKIE:
+                return v
+        return ""
+
+    def current_user(self):
+        if hasattr(self, "_user"):
+            return self._user
+        self._user = None
+        tok = self.session_token()
+        if tok:
+            with db() as conn:
+                r = conn.execute("SELECT u.id, u.username, u.display_name, u.active, s.expires FROM sessions s "
+                                 "JOIN users u ON u.id = s.user_id WHERE s.token_hash=?", (token_hash(tok),)).fetchone()
+                if r and r["expires"] > time.time() and r["active"]:
+                    on = twofa_enabled(conn, r["id"])
+                    self._user = {"id": r["id"], "username": r["username"], "display_name": r["display_name"] or r["username"],
+                                  "twofa": on, "must_2fa": not on and twofa_required(conn)}
+                elif r:
+                    conn.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(tok),))
+        return self._user
+
+    def cookie_header(self, value, max_age):
+        parts = [f"{COOKIE}={value}", "Path=/", "HttpOnly", "SameSite=Lax", f"Max-Age={max_age}"]
+        if SECURE_COOKIES:
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def start_session(self, user_id):
+        tok = secrets.token_urlsafe(32)
+        with db() as conn:
+            conn.execute("DELETE FROM sessions WHERE expires < ?", (time.time(),))
+            conn.execute("INSERT INTO sessions (token_hash, user_id, expires, created_at, ip, user_agent) VALUES (?, ?, ?, ?, ?, ?)",
+                         (token_hash(tok), user_id, time.time() + SESSION_DAYS * 86400, now_iso(), self.client_ip(),
+                          (self.headers.get("User-Agent") or "")[:200]))
+            conn.execute("UPDATE users SET last_login=? WHERE id=?", (now_iso(), user_id))
+        return tok
+
+    # -- Routing ----------------------------------------------------------
+    def do_GET(self):
+        self.handle_request("GET")
+
+    def do_HEAD(self):   # z. B. curl -I nach dem Deployment
+        self.head_only = True
+        self.handle_request("GET")
+
+    def do_POST(self):
+        self.handle_request("POST")
+
+    def do_PUT(self):
+        self.handle_request("PUT")
+
+    def do_DELETE(self):
+        self.handle_request("DELETE")
+
+    def handle_request(self, method):
+        try:
+            self.route(method)
+        except PayloadTooLarge:
+            self.send_json({"error": "Anfrage zu groß"}, 413)
+        except BadRequest as e:
+            self.send_json({"error": str(e)}, 400)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def route(self, method):
+        p = self.parts()
+        head = p[0] if p else ""
+
+        # ---- öffentlich ----
+        if method == "GET" and p == ["healthz"]:
+            return self.send_json({"ok": True, "version": VERSION})
+        if method == "GET" and p == ["robots.txt"]:
+            body = b"User-agent: *\nDisallow: /\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            return self.wfile.write(body)
+        if method == "GET" and head == "static" and len(p) == 2 and p[1] in PUBLIC_STATIC:
+            return self.serve_under(STATIC, p[1:])
+        if method == "GET" and p == ["favicon.ico"]:
+            return self.serve_under(STATIC, ["icon.svg"])
+        if method == "GET" and p == ["login"]:
+            if self.current_user():
+                return self.redirect("/")
+            return self.send_file(STATIC / "login.html")
+        if head == "auth":
+            return self.api_auth(method, p[1:])
+
+        # ---- ab hier nur mit Anmeldung ----
+        user = self.current_user()
+        if not user:
+            if head == "api":
+                return self.send_json({"error": "Nicht angemeldet"}, 401)
+            return self.redirect("/login")
+        if method != "GET" and self.headers.get(CSRF_HEADER) != "1":
+            return self.send_json({"error": "Ungültige Anfrage"}, 403)
+
+        if method == "GET" and not p:
+            return self.send_file(STATIC / "index.html")
+        if method == "GET" and head == "static" and len(p) >= 2:
+            return self.serve_under(STATIC, p[1:])
+        if head == "api":
+            return self.api(method, p[1:], user)
+        return self.send_error(404)
+
+    # -- Anmeldung --------------------------------------------------------
+    def api_auth(self, method, p):
+        name = p[0] if p else ""
+        if method != "POST" or self.headers.get(CSRF_HEADER) != "1":
+            return self.send_json({"error": "Ungültige Anfrage"}, 403)
+        if name == "login":
+            ip = self.client_ip()
+            locked_msg = f"Zu viele Fehlversuche. Bitte in {ACCOUNT_LOCK_MINUTES} Minuten erneut versuchen."
+            if ip_blocked(ip):
+                return self.send_json({"error": locked_msg}, 429)
+            data = self.read_json()
+            username = str(data.get("username") or "").strip()[:80]
+            password = str(data.get("password") or "")[:200]
+            with db() as conn:
+                u = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+                if u and not u["active"]:
+                    u = None
+                if account_locked(u, username):
+                    ip_failed(ip)
+                    time.sleep(0.6)
+                    return self.send_json({"error": locked_msg}, 429)
+                if u:
+                    ok = check_pw(password, u["pw_hash"])
+                else:
+                    dummy_check_pw(password)
+                    ok = False
+                need = False
+                if ok:
+                    need = twofa_enabled(conn, u["id"])
+                    if not need:
+                        account_ok(conn, u["id"])
+                        audit(conn, {"id": u["id"], "display_name": u["display_name"]}, "Angemeldet", "users", u["id"],
+                              u["username"], {"ip": ip})
+                else:
+                    ip_failed(ip)
+                    locked = account_failed(conn, u, username)
+            if not ok:
+                time.sleep(0.6)
+                return self.send_json({"error": locked_msg if locked else "Benutzername oder Passwort falsch."}, 429 if locked else 401)
+            if need:   # Passwort stimmt, jetzt noch der Code aus der App (Sitzung erst danach)
+                return self.send_json({"need_2fa": True, "ticket": twofa_ticket_new(u["id"])})
+            tok = self.start_session(u["id"])
+            return self.send_json({"ok": True}, headers={"Set-Cookie": self.cookie_header(tok, SESSION_DAYS * 86400)})
+        if name == "login2":
+            ip = self.client_ip()
+            locked_msg = f"Zu viele Fehlversuche. Bitte in {ACCOUNT_LOCK_MINUTES} Minuten erneut versuchen."
+            if ip_blocked(ip):
+                return self.send_json({"error": locked_msg}, 429)
+            data = self.read_json()
+            th = token_hash(str(data.get("ticket") or ""))
+            with FAILED_LOCK:
+                t = TWOFA_TICKETS.get(th)
+                if t and (t["expires"] < time.time() or t["tries"] >= ACCOUNT_FAIL_MAX):
+                    TWOFA_TICKETS.pop(th, None)
+                    t = None
+            if not t:
+                return self.send_json({"error": "Die Anmeldung ist abgelaufen. Bitte noch einmal mit Benutzername und Passwort anmelden.",
+                                       "restart": True}, 400)
+            with db() as conn:
+                u = conn.execute("SELECT * FROM users WHERE id=? AND active=1", (t["uid"],)).fetchone()
+                if not u or account_locked(u, ""):
+                    with FAILED_LOCK:
+                        TWOFA_TICKETS.pop(th, None)
+                    return self.send_json({"error": locked_msg, "restart": True}, 429)
+                kind = twofa_check(conn, u["id"], str(data.get("code") or "")[:40])
+                if kind:
+                    account_ok(conn, u["id"])
+                    with FAILED_LOCK:
+                        TWOFA_TICKETS.pop(th, None)
+                    left = len(json.loads(twofa_row(conn, u["id"])["recovery"] or "[]"))
+                    audit(conn, {"id": u["id"], "display_name": u["display_name"]}, "Angemeldet", "users", u["id"], u["username"],
+                          {"ip": ip, "zweiter Faktor": "Wiederherstellungscode" if kind == "recovery" else "App"})
+                else:
+                    ip_failed(ip)
+                    locked = account_failed(conn, u, u["username"])
+                    with FAILED_LOCK:
+                        t["tries"] += 1
+            if not kind:
+                time.sleep(0.6)
+                if locked:
+                    return self.send_json({"error": locked_msg, "restart": True}, 429)
+                return self.send_json({"error": "Der Code stimmt nicht. Bitte den aktuellen Code aus der App eingeben."}, 401)
+            tok = self.start_session(u["id"])
+            extra = {"recovery_left": left, "next": "/#/sicherheit"} if kind == "recovery" else {}
+            return self.send_json({"ok": True, **extra}, headers={"Set-Cookie": self.cookie_header(tok, SESSION_DAYS * 86400)})
+        if name == "logout":
+            tok = self.session_token()
+            user = self.current_user()
+            with db() as conn:
+                if tok:
+                    conn.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(tok),))
+                if user:
+                    audit(conn, user, "Abgemeldet", "users", user["id"], user["username"])
+            return self.send_json({"ok": True}, headers={"Set-Cookie": self.cookie_header("", 0)})
+        return self.send_json({"error": "Unbekannt"}, 404)
+
+    # -- API --------------------------------------------------------------
+    def api(self, method, p, user):
+        head = p[0] if p else ""
+        if head == "me" and p[1:2] == ["2fa"]:
+            return self.api_twofa(method, p[2:], user)
+        # Zwei-Faktor ist Pflicht, aber noch nicht eingerichtet: nur Profil und Einrichtung erreichbar
+        if user["must_2fa"] and head != "me":
+            return self.send_json({"error": "Bitte zuerst die Zwei-Faktor-Anmeldung einrichten.", "need_2fa": True}, 403)
+        if method == "GET" and head == "me":
+            return self.send_json({"user": user, "version": VERSION, "domain": DOMAIN})
+        if method == "GET" and head == "pakete":
+            with db() as conn:
+                rows = [row_dict(r) for r in conn.execute("SELECT * FROM pakete ORDER BY sort, id")]
+            return self.send_json(rows)
+        if method == "GET" and head == "einstellungen":
+            with db() as conn:
+                out = {k: get_setting(conn, k) for k in DEFAULT_SETTINGS}
+            return self.send_json(out)
+        return self.send_json({"error": "Unbekannte Schnittstelle"}, 404)
+
+    # -- Zwei-Faktor des eigenen Kontos (/api/me/2fa) ----------------------
+    def api_twofa(self, method, p, user):
+        what = p[0] if p else ""
+        uid = user["id"]
+        if method == "GET" and not what:
+            with db() as conn:
+                r = twofa_row(conn, uid)
+                on = bool(r and r["enabled"])
+                return self.send_json({"enabled": on, "required": twofa_required(conn),
+                                       "recovery_left": len(json.loads(r["recovery"] or "[]")) if on else 0,
+                                       "enabled_at": r["enabled_at"] if on else None})
+        if method != "POST" or what not in ("setup", "enable", "recovery", "disable"):
+            return self.send_json({"error": "Unbekannte Schnittstelle"}, 404)
+        data = self.read_json()
+        if what in ("setup", "recovery", "disable"):   # nur mit dem Passwort (schützt vor fremder Nutzung einer offenen Sitzung)
+            with db() as conn:
+                pw_hash = conn.execute("SELECT pw_hash FROM users WHERE id=?", (uid,)).fetchone()["pw_hash"]
+            if not check_pw(str(data.get("password") or "")[:200], pw_hash):
+                ip_failed(self.client_ip())
+                time.sleep(0.6)
+                return self.send_json({"error": "Das Passwort stimmt nicht."}, 400)
+        with db() as conn:
+            r = twofa_row(conn, uid)
+            on = bool(r and r["enabled"])
+            if what == "setup":
+                if on:
+                    return self.send_json({"error": "Die Zwei-Faktor-Anmeldung ist schon eingerichtet."}, 400)
+                secret = base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+                conn.execute("INSERT INTO user_2fa (user_id, enabled, pending_secret, pending_expires) VALUES (?, 0, ?, ?) "
+                             "ON CONFLICT(user_id) DO UPDATE SET pending_secret=excluded.pending_secret, "
+                             "pending_expires=excluded.pending_expires", (uid, secret, time.time() + 900))
+                return self.send_json({"secret": secret, "uri": totp_uri(secret, user["username"]), "issuer": TOTP_ISSUER,
+                                       "account": user["username"]})
+            if what == "enable":
+                if on:
+                    return self.send_json({"error": "Die Zwei-Faktor-Anmeldung ist schon eingerichtet."}, 400)
+                if not r or not r["pending_secret"] or (r["pending_expires"] or 0) < time.time():
+                    return self.send_json({"error": "Die Einrichtung ist abgelaufen. Bitte noch einmal starten."}, 400)
+                step = totp_match(r["pending_secret"], data.get("code"))
+                if not step:
+                    time.sleep(0.4)
+                    return self.send_json({"error": "Der Code stimmt nicht. Prüfe, ob die Uhrzeit am Handy stimmt, "
+                                                    "und gib den aktuellen Code ein."}, 400)
+                codes, hashes = recovery_new()
+                conn.execute("UPDATE user_2fa SET secret=pending_secret, pending_secret=NULL, pending_expires=NULL, enabled=1, "
+                             "last_step=?, recovery=?, enabled_at=? WHERE user_id=?", (step, json.dumps(hashes), now_iso(), uid))
+                # andere Geräte müssen sich neu anmelden, diese Sitzung bleibt
+                conn.execute("DELETE FROM sessions WHERE user_id=? AND token_hash != ?", (uid, token_hash(self.session_token())))
+                audit(conn, user, "Zwei-Faktor-Anmeldung eingerichtet", "users", uid, user["username"])
+                return self.send_json({"ok": True, "codes": codes})
+            if what == "recovery":
+                if not on:
+                    return self.send_json({"error": "Die Zwei-Faktor-Anmeldung ist nicht eingerichtet."}, 400)
+                codes, hashes = recovery_new()
+                conn.execute("UPDATE user_2fa SET recovery=? WHERE user_id=?", (json.dumps(hashes), uid))
+                audit(conn, user, "Neue Wiederherstellungscodes", "users", uid, user["username"])
+                return self.send_json({"ok": True, "codes": codes})
+            # disable
+            if not on:
+                return self.send_json({"error": "Die Zwei-Faktor-Anmeldung ist nicht eingerichtet."}, 400)
+            if twofa_required(conn):
+                return self.send_json({"error": "Die Zwei-Faktor-Anmeldung ist Pflicht und lässt sich hier nicht ausschalten. "
+                                                "Notfall: auf dem Server python server.py 2fa-reset <name>."}, 400)
+            conn.execute("DELETE FROM user_2fa WHERE user_id=?", (uid,))
+            audit(conn, user, "Zwei-Faktor-Anmeldung ausgeschaltet", "users", uid, user["username"])
+            return self.send_json({"ok": True})
+
+
+class BadRequest(Exception):
+    pass
+
+
+def cli():
+    cmd = sys.argv[1]
+    init_db()
+    if cmd == "users":
+        with db() as conn:
+            for r in conn.execute("SELECT username, active, last_login FROM users ORDER BY id"):
+                print(f"{r['username']:20} {'aktiv' if r['active'] else 'inaktiv':8} zuletzt: {r['last_login'] or '-'}")
+        return
+    if len(sys.argv) < 3:
+        print(f"Aufruf: python server.py {cmd} <benutzername>")
+        sys.exit(2)
+    name = sys.argv[2]
+    if cmd == "2fa-reset":
+        try:
+            twofa_reset(name)
+        except ValueError as e:
+            print(e)
+            sys.exit(1)
+        print(f"Zwei-Faktor-Anmeldung für {name} zurückgesetzt. Beim nächsten Login muss sie neu eingerichtet werden.")
+        return
+    pw = getpass.getpass("Neues Passwort (mindestens 10 Zeichen): ")
+    if pw != getpass.getpass("Passwort wiederholen: "):
+        print("Die Passwörter stimmen nicht überein.")
+        sys.exit(1)
+    try:
+        if cmd == "adduser":
+            create_user(name, pw)
+            print(f"Benutzer {name} wurde angelegt.")
+        else:
+            set_password(name, pw)
+            print(f"Passwort für {name} wurde gesetzt, alte Sitzungen sind abgemeldet.")
+    except ValueError as e:
+        print(e)
+        sys.exit(1)
+
+
+def make_server(host=HOST, port=PORT):
+    init_db()
+    bootstrap_admin()
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd.daemon_threads = True
+    return httpd
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("adduser", "passwd", "users", "2fa-reset"):
+        return cli()
+    httpd = make_server()
+    print("=" * 56)
+    print(f"  {APP_NAME} {VERSION}")
+    print(f"  Läuft unter http://{'127.0.0.1' if HOST in ('0.0.0.0', '::') else HOST}:{PORT}/")
+    print(f"  Daten: {DATA}")
+    if user_count() == 0:
+        print("  Noch kein Benutzer. Anlegen mit: python server.py adduser <name>")
+        print("  oder STUDIO_ADMIN_USER und STUDIO_ADMIN_PASSWORD in der .env setzen.")
+    print("=" * 56, flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

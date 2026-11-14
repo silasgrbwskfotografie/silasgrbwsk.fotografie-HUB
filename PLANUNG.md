@@ -17,11 +17,11 @@ Bewusst nicht Teil des Tools:
 
 - **Rechnungen schreiben.** Das bleibt in Finom. Das Tool zeigt nur, was noch abzurechnen ist, und merkt sich die Finom-Rechnungsnummer.
 - **Bilder speichern oder ausliefern.** Das bleibt bei Picdrop und pCloud. Das Tool verwaltet nur die Links und Fristen.
-- **Buchhaltung und Steuer.** Es gibt eine Umsatzübersicht, aber keine EÜR.
+- **Amtliche Buchhaltung und Steuererklärung.** Keine Abgabe ans Finanzamt (kein ELSTER), keine GoBD-Buchhaltung. Ab Phase 10 bereitet das Tool aber Einnahmen, Ausgaben, Belege und Fahrten so vor, dass Finom oder die Steuerberatung damit arbeiten können.
 
 ## Funktionsumfang
 
-Sieben Module plus eine Startseite. Die ersten vier drehen sich um den Auftrag, dazu kommen E-Mail, Kalender und Aufgaben.
+Neun Module plus eine Startseite. Die ersten vier drehen sich um den Auftrag, dazu kommen E-Mail, Kalender, Aufgaben, die Steuer-Vorbereitung und das Fahrtenbuch.
 
 ### Startseite (Dashboard)
 
@@ -116,16 +116,51 @@ Hinweis zu Gmail: Google akzeptiert für IMAP kein normales Passwort mehr. Du br
 - Die App braucht eine Verbindung. Der Service Worker zeigt wie im Hub nur Push an und speichert nichts auf dem Gerät.
 - Kein App Store nötig. Eine echte native App wäre deutlich mehr Aufwand (Apple-Entwicklerkonto, eigener Build) und bringt für diesen Zweck kaum Vorteile.
 
+### Ausgaben und Steuer-Vorbereitung (Phase 10)
+
+Vorbereitung für Steuerberatung und Finom, ausdrücklich keine amtliche Buchhaltung und keine Abgabe ans Finanzamt.
+
+- Ausgaben erfassen: Datum, Betrag, Kategorie, Lieferant, Zahlart, Notiz, Beleg als PDF oder Foto vom iPhone. Optional einem Auftrag zuordnen.
+- Kategorien als Vorlage, zum Beispiel Ausrüstung, Software und Abos, Fahrtkosten, Telefon und Internet, Fortbildung, Bürobedarf, Sonstiges. Änderbar in den Einstellungen.
+- Anlagegüter markieren (zum Beispiel Kamera, Objektiv) mit Kaufdatum, damit die Steuerberatung die Abschreibung festlegen kann. Das Tool rechnet keine Abschreibung aus.
+- Einnahmen kommen automatisch aus den bezahlten Zahlungen, nichts doppelt eintippen.
+- Übersicht im Aufbau einer EÜR: Einnahmen, Ausgaben je Kategorie und Ergebnis je Monat und Jahr. Klar beschriftet als Vorbereitung, nicht als amtliche Erklärung.
+- Fahrten kommen aus dem Fahrtenbuch (Phase 11). Bis dahin eine einfache Liste aus den Kilometern der Aufträge.
+- Belege, deren Datum oder Betrag fehlt, erscheinen als "unvollständig".
+- Export je Zeitraum: CSV für Einnahmen, Ausgaben und Fahrten, dazu alle Belege als ZIP mit verständlichen Dateinamen. DATEV-Format nur, wenn die Steuerberatung es verlangt.
+- Abgeschlossene Monate lassen sich sperren, danach sind Änderungen nur mit Vermerk im Protokoll möglich.
+- Umsatzsteuer: nur Felder für Steuersatz und Steuerbetrag je Beleg. Welche Regeln gelten (Kleinunternehmer oder nicht), klärt Silas mit der Steuerberatung.
+
+Vor dem Bau mit der Steuerberatung klären: welche Kategorien, welches Exportformat, ob Kleinunternehmerregelung gilt und wie Belege aufbewahrt werden müssen.
+
+### Fahrtenbuch (Phase 11)
+
+Ersetzt Driversnote. Ziel ist ein Fahrtenbuch, das den Anforderungen des Finanzamts an ein elektronisches Fahrtenbuch möglichst entspricht.
+Ob es anerkannt wird, entscheidet am Ende das Finanzamt. Vor dem Umstieg mit der Steuerberatung abstimmen.
+
+- Fahrten mit Datum, Uhrzeit Beginn und Ende, Kilometerstand Beginn und Ende, Start- und Zieladresse, Zweck, Geschäftspartner (Kunde oder Auftrag) und Art: betrieblich, privat, Wohnung und Arbeitsstätte. Bei Umwegen eine Begründung.
+- Kilometerstände lückenlos: Der Anfangsstand jeder Fahrt muss zum Endstand der vorherigen passen, sonst Warnung. Abgleich mit Kilometerständen auf Werkstatt- und Tankbelegen.
+- Mehrere Fahrzeuge möglich, je Fahrzeug eigene Kilometerfolge.
+- Nachträgliche Änderungen: Der Zeitpunkt jeder Erfassung wird gespeichert. Jede Änderung wird mit altem und neuem Wert protokolliert und bleibt sichtbar. Abgeschlossene Monate sind gesperrt.
+- Aufträge verknüpfen: Aus einem Auftrag mit Ort entsteht ein Fahrtvorschlag, der nur noch bestätigt werden muss.
+- **Import aus Driversnote:** Export-Datei hochladen, Vorschau mit Zuordnung der Spalten, Dubletten erkennen. Importierte Fahrten sind als "aus Driversnote" markiert, die Original-Datei wird aufbewahrt. Das genaue Format wird erst mit einer echten Export-Datei festgelegt.
+- **GPS-Aufzeichnung** in der Web-App: Start und Stopp per Knopf, Punkte mit schlechter Genauigkeit werden verworfen, Strecke aus den Punkten berechnet.
+  Maßgeblich für das Fahrtenbuch bleibt der Kilometerstand vom Tacho, die GPS-Strecke dient als Vorschlag und Kontrolle.
+  Grenze des iPhones: Eine Web-App zeichnet nur auf, solange sie im Vordergrund ist und der Bildschirm an ist. Bei gesperrtem Bildschirm oder wenn eine Navigations-App vorne ist, stoppt die Aufzeichnung. Das Tool erkennt solche Lücken und zeigt sie an.
+- **Karte:** Jede Fahrt mit aufgezeichneter Strecke auf einer Karte, Kartenbibliothek lokal eingebunden. Woher die Kartenbilder kommen, ist eine offene Entscheidung (siehe offene Punkte).
+- Auswertung je Jahr und Fahrzeug: betriebliche, private und Arbeitsweg-Kilometer, Anteil in Prozent. Export als PDF und CSV.
+
 ### Später möglich, nicht in Version 1
 
 - Erinnerungen per E-Mail oder Telegram
 - Kundenbereich oder öffentliches Anfrageformular
 - Vertrags-PDF direkt aus einer Vorlage erzeugen
-- Fahrtenliste für die Steuer
+- Zahlungseingänge automatisch über die Bankschnittstelle (XS2A) abgleichen
+- Eigene iPhone-App für das Fahrtenbuch, falls GPS im Hintergrund nötig wird (braucht Apple-Entwicklerkonto)
 
 ## Datenmodell
 
-Sieben Tabellen bilden den Kern, acht weitere kommen für Postfach, Kalender, Aufgaben, Push und Betrieb dazu. Der Auftrag ist der Mittelpunkt, alles andere hängt daran oder am Kunden.
+Sieben Tabellen bilden den Kern, acht weitere kommen für Postfach, Kalender, Aufgaben, Push und Betrieb dazu, drei für die Steuer-Vorbereitung. Der Auftrag ist der Mittelpunkt, alles andere hängt daran oder am Kunden.
 
 | Tabelle | Zweck | Wichtige Felder |
 | --- | --- | --- |
@@ -147,6 +182,15 @@ Sieben Tabellen bilden den Kern, acht weitere kommen für Postfach, Kalender, Au
 | Push-Abo | Angemeldetes Gerät | Endpunkt, Schlüssel, Gerätename, angelegt am |
 | secrets | Geschützte Ablage für Zugangsdaten, wie im Hub | Schlüssel, Wert. Nie über die API lesbar, nicht im Backup-Download. |
 | audit | Änderungsprotokoll, wie im Hub | Zeitpunkt, Aktion (gesendet, gelöscht, geändert), Bezug |
+
+| Tabelle (Phase 10) | Zweck | Wichtige Felder |
+| --- | --- | --- |
+| Ausgabe | Beleg einer Ausgabe | Datum, Betrag in Cent, Steuersatz, Steuerbetrag in Cent, Kategorie, Lieferant, Zahlart, Anlagegut, Auftrag, Datei, Notiz |
+| Ausgaben-Kategorie | Vorlage für Kategorien | Name, Sortierung, aktiv |
+| Fahrzeug | Auto für das Fahrtenbuch | Name, Kennzeichen, Anfangs-Kilometerstand, aktiv |
+| Fahrt | Eintrag im Fahrtenbuch (Phase 11) | Fahrzeug, Datum, Beginn, Ende, km-Stand Beginn und Ende, Start, Ziel, Zweck, Geschäftspartner, Art, Umweg-Begründung, Kunde, Auftrag, Quelle (Hand, GPS, Driversnote), erfasst am, gesperrt |
+| Fahrt-Punkt | GPS-Punkt einer aufgezeichneten Fahrt | Fahrt, Zeit, Breite, Länge, Genauigkeit |
+| Fahrt-Änderung | Protokoll jeder Änderung an einer Fahrt | Fahrt, Zeitpunkt, Feld, alter Wert, neuer Wert, Grund |
 
 Dazu kommen zwei technische Tabellen: Einstellungen (Anfahrt frei bis km, Preis je km, Lieferfrist in Tagen, Picdrop-Laufzeit, Umsatzgrenze) und Dokument (freie Dateiablage je Kunde).
 
@@ -276,7 +320,7 @@ Das Tool enthält Namen, Kontaktdaten und Verträge und hängt am offenen Intern
 - Höchstens 20 Empfänger je Mail, Adressen geprüft.
 - Push nur zu bekannten Push-Diensten, Inhalt nur Betreff und Absendername. Der Service Worker speichert nichts.
 - Für Gmail ein eigenes App-Passwort nur für dieses Tool anlegen, damit es sich einzeln widerrufen lässt.
-- Weil das Tool Zugriff auf deine Postfächer hat, empfehle ich einen zweiten Faktor beim Login (TOTP). Das steht nicht in der Vorlage, ist also deine Entscheidung.
+- Zweiter Faktor beim Login (TOTP) ist Pflicht, weil das Tool Zugriff auf deine Postfächer hat. Notfall ohne Handy und ohne Codes: `python server.py 2fa-reset <name>` im Container.
 - Push und Mail-Abruf in der Datenschutzerklärung erwähnen, falls das Tool eine bekommt. netcup als Hosting-Anbieter nennen.
 
 **Datenschutz**
@@ -297,7 +341,7 @@ Rechtlicher Hinweis: Die Datenschutzpunkte sind eine Orientierung und keine Rech
 
 ## Bauphasen
 
-Neun Phasen, jede endet mit etwas, das du im Browser prüfen kannst. Phase 1 bis 6 ergeben das Auftragstool, Phase 7 bis 9 die Erweiterung um App, Kalender, Aufgaben und E-Mail. Gib Claude Code immer nur eine Phase und teste, bevor die nächste beginnt.
+Elf Phasen, jede endet mit etwas, das du im Browser prüfen kannst. Phase 1 bis 6 ergeben das Auftragstool, Phase 7 bis 9 die Erweiterung um App, Kalender, Aufgaben und E-Mail, Phase 10 die Steuer-Vorbereitung, Phase 11 das Fahrtenbuch. Gib Claude Code immer nur eine Phase und teste, bevor die nächste beginnt.
 
 1. **Grundgerüst.** Projekt anlegen, Aufbau nach dem Hub, Datenbankschema mit allen Tabellen samt secrets und audit, Seed mit deinen Paketen, Login, Layout mit Navigation, Health-Route, Dockerfile und Compose. Fertig, wenn der Container lokal startet und der Login funktioniert.
 2. **Kunden und Aufträge.** Kunden mit Kontakten, Auftrag anlegen und bearbeiten, Preisberechnung mit Anfahrt, Statuswechsel, Liste mit Filtern. Dazu die Tests für `die Preislogik`. Fertig, wenn ein HSG-Spiel und ein Spielershooting mit 28 Spielern und 25 km Anfahrt den richtigen Betrag zeigen (60 € + 3 × 0,90 € + 15 × 0,30 € = 67,20 €).
@@ -311,6 +355,10 @@ Erweiterung:
 - **Phase 7: iPhone-App und Push.** Manifest, App-Symbole, Service Worker und Web Push aus dem Hub übernehmen, untere Navigationsleiste. Fertig, wenn die App vom Home-Bildschirm im Vollbild startet und eine Test-Mitteilung auf dem iPhone ankommt.
 - **Phase 8: Kalender und Aufgaben.** Eigene Termine, Kalenderansichten, Wiederholungen, Überschneidungswarnung, Aufgaben mit Ansichten und Vorlagen je Paket, Erinnerungen über die Hintergrund-Schleife. Fertig, wenn ein neuer Pro-Auftrag automatisch seine Aufgabenliste bekommt und die Erinnerung als Push kommt.
 - **Phase 9: Postfach.** Zuerst die genannten Stellen im Hub lesen. Dann ein Konto mit "Verbindung prüfen", Ordner und Lesen, danach Schreiben, Erledigt und Löschen, danach mehrere Konten, Hintergrund-Abruf mit Push und die Verknüpfung mit Kunden und Aufträgen. Die Fähigkeiten jedes Mailanbieters vorher prüfen (MOVE, UIDPLUS, SPECIAL-USE, Namespace). Fertig, wenn eine Antwort aus dem Tool im Gesendet-Ordner des echten Postfachs liegt und "Erledigt" die Mail dort verschiebt.
+
+- **Phase 10: Ausgaben und Steuer-Vorbereitung.** Ausgaben mit Beleg-Upload (auch Foto vom iPhone), Kategorien, Anlagegüter markieren, Übersicht im Aufbau einer EÜR, Fahrtenliste, Monatssperre, Export als CSV und Belege als ZIP. Dazu Tests für Summen und Export. Fertig, wenn die Jahresübersicht mit einer Handrechnung übereinstimmt und der Export vollständig in Finom oder bei der Steuerberatung ankommt.
+
+- **Phase 11: Fahrtenbuch.** Fahrzeuge, Fahrten mit Kilometerständen und Prüfung der Lücken, Änderungsprotokoll und Monatssperre, Vorschläge aus Aufträgen, Import aus Driversnote, GPS-Aufzeichnung mit Lückenanzeige, Karte, Jahresauswertung mit PDF- und CSV-Export. Dazu Tests für Kilometerfolge, Streckenberechnung und Import. Fertig, wenn der Driversnote-Export vollständig übernommen ist, eine echte Fahrt per GPS höchstens wenige Prozent vom Tacho abweicht und die Strecke auf der Karte erscheint.
 
 Das Postfach ist durch die Vorlage aus dem Hub deutlich weniger Arbeit als ein Neubau. Es bleibt trotzdem am Ende, weil es Anmeldung, secrets, audit und Push voraussetzt.
 
@@ -328,7 +376,7 @@ Vorschlag für die OFFEN-Stellen im Kopf der `CLAUDE.md`:
 | --- | --- |
 | Name | Studio-Tool (Arbeitstitel) |
 | Zweck | Internes Verwaltungstool für silasgrbwsk.fotografie: Aufträge, Zahlungen, Bildauslieferung, Verträge, Postfach, Kalender, Aufgaben. Einziger Nutzer: Silas. |
-| Domain | noch offen |
+| Domain | `hub.silasgrbwskfotografie.de` |
 | Technik | Python und SQLite im Aufbau des Hubs, eigener Code |
 | Repository | Empfehlung: privat |
 | Suchmaschinen | `noindex`, weil rein intern |
@@ -360,7 +408,8 @@ Für jede weitere Phase reicht: "Phase 1 ist getestet. Setze jetzt Phase 2 aus P
 
 Offene Punkte, die du vor dem Start klären solltest:
 
-- [ ] Welche Domain, bei welchem DNS-Anbieter, mit oder ohne `www`? Läuft unter der Domain schon E-Mail?
+- [x] Domain: `hub.silasgrbwskfotografie.de` (Subdomain, ohne `www`)
+- [x] DNS bei netcup, E-Mail läuft dort schon (MX und TXT bleiben unverändert). A-Eintrag `hub` auf `62.83.124.184` ist gesetzt.
 - [ ] Repository öffentlich oder privat?
 - [ ] Erst auf der Test-VM ausprobieren oder direkt auf den VPS?
 - [ ] Reicht der Arbeitsspeicher des VPS für Hub und Studio-Tool (`free -h`)?
@@ -368,9 +417,14 @@ Offene Punkte, die du vor dem Start klären solltest:
 - [ ] Gmail: Sind App-Passwörter in deinem Google-Konto verfügbar? Gmail arbeitet mit Labels statt Ordnern, "Erledigt" dort eigens testen.
 - [ ] Stimmt es, dass Zuweisen, Rechte, Gruppen und Kontaktformular aus dem Hub entfallen, weil nur du das Tool nutzt?
 - [ ] Eigene Signatur für die Fotografie (Logo, Farben)?
-- [ ] Zweiter Faktor beim Login, ja oder nein?
+- [x] Zweiter Faktor beim Login: ja, als Pflicht (TOTP mit Authenticator-App, 10 Wiederherstellungscodes). Eingebaut in Phase 1.
 - [ ] Stimmen die Pakete und Preise noch, und fehlen welche (zum Beispiel Livestream oder Portraitshooting)?
 - [ ] Welche Umsatzgrenze soll das Dashboard anzeigen? Den aktuellen Wert für Kleinunternehmer bitte mit Steuerberatung oder Finanzamt abgleichen.
 - [ ] Wie wird gesichert (Datenbank, Uploads), wohin, und wer aktualisiert?
 - [ ] Soll der Kalender nur exportieren (ICS-Abo) oder auch einen bestehenden Kalender einlesen?
 - [ ] Welche Standard-Aufgaben gehören zu welchem Paket?
+- [ ] Phase 10: Kategorien, Exportformat und Kleinunternehmerregelung mit der Steuerberatung klären.
+- [ ] Phase 11: Beispiel-Export aus Driversnote (CSV oder Excel) bereitstellen.
+- [ ] Phase 11: Kartenbilder von OpenStreetMap laden (dann sieht der Kartendienst die angezeigten Gegenden) oder Karte ohne Hintergrund, nur die Strecke?
+- [ ] Phase 11: Reicht GPS nur bei eingeschaltetem Bildschirm (Handy in der Halterung), oder wird eine eigene iPhone-App gebraucht?
+- [ ] Phase 11: Firmenwagen oder privates Auto mit betrieblicher Nutzung? Wofür das Fahrtenbuch steuerlich gebraucht wird, mit der Steuerberatung klären.
