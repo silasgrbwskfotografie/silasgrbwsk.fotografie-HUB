@@ -210,7 +210,7 @@ App.pages.auftraege = async (view) => {
     // auf dem Handy wird jede Zeile zur Karte (style.css: .tbl.karten)
     $('#aListe').innerHTML = `<table class="tbl karten"><thead><tr><th>Datum</th><th>Begegnung</th><th>Kunde</th><th>Paket</th><th>Status</th><th class="num">Betrag</th></tr></thead><tbody>`
       + liste.map(a => `<tr${a.archiviert || a.status === 'Abgesagt' ? ' class="muted"' : ''}>
-        <td class="k-datum nowrap">${datum(a.datum)}${a.uhrzeit ? ` <span class="muted small">${esc(a.uhrzeit)} Uhr</span>` : ''}</td>
+        <td class="k-datum nowrap">${ampelPunkt(a)}${datum(a.datum)}${a.uhrzeit ? ` <span class="muted small">${esc(a.uhrzeit)} Uhr</span>` : ''}</td>
         <td class="k-titel"><a class="linkbtn" href="#/auftrag/${a.id}"><b>${esc(a.begegnung || 'ohne Titel')}</b></a>
           ${a.ort || a.sportart ? `<br><span class="muted small">${[a.sportart, a.ort].filter(Boolean).map(esc).join(' · ')}</span>` : ''}</td>
         <td class="k-kunde">${esc(byId(kunden, a.kunde_id)?.name || '')}</td><td class="k-paket">${esc(byId(pakete, a.paket_id)?.name || '')}</td>
@@ -237,8 +237,10 @@ App.pages.auftraege = async (view) => {
 
 /* ---------- Ein Auftrag: alles an einer Stelle (#/auftrag/<id>) ---------- */
 App.pages.auftrag = async (view, id) => {
-  const [a, auftraege, kunden, pakete, kontakte, alleZahlungen] = await Promise.all(
-    [api('auftraege/' + Number(id)), api('auftraege'), api('kunden'), api('pakete'), api('kontakte'), api('zahlungen')]);
+  const [a, auftraege, kunden, pakete, kontakte, alleZahlungen, alleLinks, vorlagen] = await Promise.all(
+    [api('auftraege/' + Number(id)), api('auftraege'), api('kunden'), api('pakete'), api('kontakte'), api('zahlungen'),
+      api('lieferlinks'), api('vorlagen')]);
+  const links = alleLinks.filter(l => l.auftrag_id === a.id);
   const zs = alleZahlungen.filter(z => z.auftrag_id === a.id);
   const zSumme = zs.reduce((sum, z) => sum + z.betrag_cent, 0);
   const kunde = byId(kunden, a.kunde_id) || {};
@@ -257,7 +259,7 @@ App.pages.auftrag = async (view, id) => {
         ${zeile('Kunde', esc(kunde.name))}${zeile('Paket', esc(byId(pakete, a.paket_id)?.name))}
         ${zeile('Datum', datum(a.datum) + (a.uhrzeit ? ', ' + esc(a.uhrzeit) + ' Uhr' : ''))}${zeile('Ort', esc(a.ort))}${zeile('Sportart', esc(a.sportart))}
         ${zeile('Spieler', a.spieler)}${zeile('Kilometer', a.km ? a.km + ' km einfache Strecke' : '')}
-        ${zeile('Lieferfrist', datum(a.lieferfrist))}</tbody></table>
+        ${zeile('Lieferfrist', datum(a.lieferfrist) + ' ' + ampelText(a))}</tbody></table>
         ${a.notizen ? `<p class="small pre">${esc(a.notizen)}</p>` : ''}</div>
       <div class="card"><h2>Preis</h2><table class="tbl"><tbody>
         <tr><td>Paket</td><td class="num">${euro(a.grundpreis_cent)}</td></tr>
@@ -273,7 +275,8 @@ App.pages.auftrag = async (view, id) => {
         ${zSumme !== a.betrag_cent && a.status !== 'Abgesagt' ? `<p class="warnline small">Die Zahlungen ergeben ${euro(zSumme)}, der Auftrag ${euro(a.betrag_cent)}.
           Bezahlte und erlassene Beträge passen sich nicht mehr an. Bitte prüfen.</p>` : ''}
         ${zs.some(z => z.art === 'Anzahlung') ? '' : '<button type="button" class="btn sm" id="anzNeu">Anzahlung hinzufügen</button>'}</div>
-      <div class="card"><h2>Bilder</h2><p class="muted small">Galerie-Links mit Fristen erscheinen hier ab Phase 4.</p></div>
+      <div class="card"><h2>Bilder</h2><div id="lListe">${links.map(linkZeile).join('') || '<p class="muted">Noch kein Galerie-Link.</p>'}</div>
+        <button type="button" class="btn sm" id="lNeu">Link hinzufügen</button></div>
     </div>`;
   const d = { auftraege, kunden, pakete };
   $('#aEdit').addEventListener('click', () => auftragDialog(a, d, { danach: (was) => { if (was === 'del') location.hash = '#/auftraege'; else router(); } }));
@@ -290,6 +293,113 @@ App.pages.auftrag = async (view, id) => {
   });
   $('#anzNeu')?.addEventListener('click', () => zahlungDialog({ art: 'Anzahlung', status: 'Offen' }, kontakte, kunden, a.kunde_id,
     { fix: { auftrag_id: a.id, art: 'Anzahlung' } }));
+  $('#lNeu').addEventListener('click', () => linkDialog({}, a, ks));
+  $('#lListe').addEventListener('click', (ev) => {
+    const b = ev.target.closest('button')?.dataset || {};
+    if (b.link) linkDialog(byId(links, b.link), a, ks);
+    if (b.nachricht) nachrichtDialog(byId(links, b.nachricht), a, ks, vorlagen);
+  });
+};
+
+/* ---------- Bildauslieferung: Bausteine ---------- */
+const AMPEL = { rot: 'überfällig', gelb: 'fällig', gruen: 'geliefert', keine: '' };
+const ampelPunkt = a => a.ampel && a.ampel !== 'keine'
+  ? `<span class="ampel ${a.ampel}" role="img" aria-label="Lieferung ${AMPEL[a.ampel]}" title="Lieferung ${AMPEL[a.ampel]}"></span>` : '';
+const ampelText = a => a.ampel && a.ampel !== 'keine'
+  ? `<span class="badge ${{ rot: 'bad', gelb: 'warn', gruen: 'ok' }[a.ampel]}">${AMPEL[a.ampel]}</span>` : '';
+
+function tageBis(iso) {
+  const h = new Date(); h.setHours(0, 0, 0, 0);
+  const [y, m, t] = iso.split('-').map(Number);
+  return Math.round((new Date(y, m - 1, t) - h) / 86400000);
+}
+function ablaufText(iso) {
+  if (!iso) return '';
+  const n = tageBis(iso);
+  const cls = n < 0 ? 'bad' : n <= 7 ? 'warn' : 'plain';
+  const txt = n < 0 ? `abgelaufen am ${datum(iso)}` : n === 0 ? 'läuft heute ab' : `läuft ab am ${datum(iso)}`;
+  return `<span class="badge ${cls}">${txt}</span>`;
+}
+
+function linkZeile(l) {
+  return `<div class="link-zeile"><div class="row-head"><b>${esc(l.typ)}</b>${ablaufText(l.laeuft_ab_am)}</div>
+    <a href="${esc(l.url)}" target="_blank" rel="noopener noreferrer" class="url">${esc(l.url)}</a>
+    <span class="muted small">${[l.empfaenger && 'für ' + l.empfaenger, l.hinweis].filter(Boolean).map(esc).join(' · ')}</span>
+    <div class="btn-row"><button type="button" class="btn sm" data-nachricht="${l.id}">Nachricht</button>
+      <button type="button" class="btn sm" data-link="${l.id}">Bearbeiten</button></div></div>`;
+}
+
+function linkDialog(l, a, ks) {
+  const felder = [
+    { key: 'typ', label: 'Typ', type: 'select', options: [['Picdrop', 'Picdrop'], ['pCloud', 'pCloud'], ['Sonstiges', 'Sonstiges']], def: 'Picdrop' },
+    { key: 'laeuft_ab_am', label: 'Läuft ab am (leer bei Picdrop: Laufzeit aus den Einstellungen)', type: 'date' },
+    { key: 'url', label: 'Link (https://...)', type: 'url', required: true, full: true },
+    { key: 'empfaenger', label: 'Empfänger', list: ks.map(c => c.name) },
+    { key: 'hinweis', label: 'Hinweis (zum Beispiel mit Wasserzeichen, für Spieler)' },
+  ];
+  editRecord('lieferlinks', l.id ? 'Link bearbeiten' : 'Galerie-Link hinzufügen', felder, l, {
+    fix: l.id ? {} : { auftrag_id: a.id },
+    extra: l.id ? '' : '<p class="muted small">Mit dem ersten Link gilt der Auftrag als geliefert. Steht er noch davor, wechselt der Status auf Geliefert.</p>',
+  });
+}
+
+/* Platzhalter: {name} {spiel} {datum} {link} {ablauf} */
+function vorlageFuellen(text, l, a, ks) {
+  const w = { name: l.empfaenger || ks[0]?.name || '', spiel: a.begegnung || '', datum: datum(a.datum), link: l.url, ablauf: datum(l.laeuft_ab_am) };
+  return text.replace(/\{(name|spiel|datum|link|ablauf)\}/g, (m, k) => w[k]);
+}
+
+function nachrichtDialog(l, a, ks, vorlagen) {
+  const dlg = $('#modal');
+  if (!vorlagen.length) return toast('Noch keine Vorlage. Lege eine unter Bildauslieferung an.');
+  dlg.innerHTML = `<div class="modal-box"><h2>Nachricht zum Link</h2>
+    <div class="field"><label for="n_vorlage">Vorlage</label><select class="input" id="n_vorlage">${vorlagen.map(v => `<option value="${v.id}">${esc(v.name)}</option>`).join('')}</select></div>
+    <div class="field"><label for="n_text">Text (hier noch anpassbar)</label><textarea class="input" id="n_text" rows="9"></textarea></div>
+    <div class="modal-foot"><span></span><span class="btn-row"><button type="button" class="btn" id="n_zu">Schließen</button>
+      <button type="button" class="btn primary" id="n_copy">Text kopieren</button></span></div></div>`;
+  const fuellen = () => { $('#n_text').value = vorlageFuellen(byId(vorlagen, $('#n_vorlage').value).text, l, a, ks); };
+  $('#n_vorlage').addEventListener('change', fuellen);
+  $('#n_zu').addEventListener('click', () => dlg.close());
+  $('#n_copy').addEventListener('click', () => copyText($('#n_text').value));
+  fuellen();
+  dlg.showModal();
+}
+
+/* ---------- Bildauslieferung: Fristen, Abläufe, Vorlagen ---------- */
+App.pages.lieferung = async (view) => {
+  const [u, vorlagen] = await Promise.all([api('lieferung'), api('vorlagen')]);
+  const auftragZeile = a => `<tr><td class="nowrap">${ampelPunkt(a)}${datum(a.datum)}</td>
+    <td><a class="linkbtn" href="#/auftrag/${a.id}"><b>${esc(a.begegnung || 'ohne Titel')}</b></a><br><span class="muted small">${esc(a.kunde)}</span></td>
+    <td class="num">bis ${datum(a.lieferfrist)}</td></tr>`;
+  const linkTabelle = list => `<table class="tbl"><tbody>${list.map(l => `<tr>
+    <td><a class="linkbtn" href="#/auftrag/${l.auftrag_id}"><b>${esc(l.begegnung || 'ohne Titel')}</b></a>
+      <br><span class="muted small">${esc(l.kunde)} · ${esc(l.typ)}${l.empfaenger ? ' für ' + esc(l.empfaenger) : ''}</span></td>
+    <td class="num">${ablaufText(l.laeuft_ab_am)}</td></tr>`).join('')}</tbody></table>`;
+  const vorlageFelder = [
+    { key: 'name', label: 'Name', required: true, full: true },
+    { key: 'text', label: 'Text. Platzhalter: {name} {spiel} {datum} {link} {ablauf}', type: 'textarea', full: true },
+    { key: 'sort', label: 'Reihenfolge', type: 'number' },
+  ];
+  view.innerHTML = head('Bildauslieferung', 'Lieferfristen, Galerie-Links und Nachrichtenvorlagen')
+    + `<div class="grid g2">
+      <div class="card"><h2>Überfällig</h2>${u.ueberfaellig.length ? `<table class="tbl"><tbody>${u.ueberfaellig.map(auftragZeile).join('')}</tbody></table>`
+        : '<p class="muted">Nichts überfällig.</p>'}</div>
+      <div class="card"><h2>Fällig</h2>${u.faellig.length ? `<table class="tbl"><tbody>${u.faellig.map(auftragZeile).join('')}</tbody></table>`
+        : '<p class="muted">Keine Galerie fällig.</p>'}</div>
+      <div class="card"><h2>Links laufen in 7 Tagen ab</h2>${u.laeuft_ab.length ? linkTabelle(u.laeuft_ab) : '<p class="muted">Kein Link läuft bald ab.</p>'}</div>
+      <div class="card"><h2>Abgelaufen (letzte 30 Tage)</h2>${u.abgelaufen.length ? linkTabelle(u.abgelaufen) : '<p class="muted">Kein Link abgelaufen.</p>'}</div>
+      <div class="card"><h2>Nachrichtenvorlagen</h2>
+        <ul class="kontakte">${vorlagen.map(v => `<li><button type="button" class="linkbtn" data-vorlage="${v.id}"><b>${esc(v.name)}</b></button>
+          <p class="muted small pre">${esc(v.text)}</p></li>`).join('')}</ul>
+        <button type="button" class="btn sm" id="vNeu">Vorlage hinzufügen</button>
+        <p class="muted small">Die Nachricht zu einem Link erstellst du auf der Seite des Auftrags, Knopf "Nachricht".</p></div>
+    </div>`;
+  $('#vNeu').addEventListener('click', () => editRecord('vorlagen', 'Vorlage hinzufügen', vorlageFelder));
+  // an die Inhaltsfläche dieser Seite hängen, nicht an #view: der bleibt für alle Seiten und sammelte sonst Handler
+  $('.grid', view).addEventListener('click', (ev) => {
+    const id = ev.target.closest('button')?.dataset.vorlage;
+    if (id) editRecord('vorlagen', 'Vorlage bearbeiten', vorlageFelder, byId(vorlagen, id));
+  });
 };
 
 /* ---------- Zahlungen: Bausteine ---------- */
@@ -370,12 +480,13 @@ App.pages.zahlungen = async (view) => {
   // Breite des Balkens per JS: die CSP erlaubt keine style-Attribute im HTML
   $$('.balken span', view).forEach(el => { el.style.width = Math.min(100, anteil) + '%'; });
   $('#uJahr').addEventListener('change', (ev) => { Filter.uJahr = Number(ev.target.value); router(); });
-  view.addEventListener('click', async (ev) => {
+  // an die Inhaltsfläche dieser Seite hängen, nicht an #view: der bleibt für alle Seiten und sammelte sonst Handler
+  $('.grid', view).addEventListener('click', async (ev) => {
     const d = ev.target.closest('button')?.dataset || {};
     if (d.zahlung) { const z = byId(zahlungen, d.zahlung); zahlungDialog(z, kontakte, kunden, auftrag(z.auftrag_id).kunde_id); }
     if (d.copy) copyText(byId(abr, d.copy).text);
   });
-  view.addEventListener('submit', async (ev) => {
+  $('.grid', view).addEventListener('submit', async (ev) => {
     const id = ev.target.dataset.finom;
     if (!id) return;
     ev.preventDefault();

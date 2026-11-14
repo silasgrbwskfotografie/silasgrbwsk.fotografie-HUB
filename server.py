@@ -42,7 +42,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
-VERSION = "0.4"
+VERSION = "0.5"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -183,6 +183,11 @@ TABLES = {
         "groesse": "INTEGER",
         "notizen": "TEXT",
         "hochgeladen_am": "TEXT",
+    },
+    "vorlagen": {                                        # Nachrichtenvorlagen mit Platzhaltern {name} {spiel} {datum} {link} {ablauf}
+        "name": "TEXT NOT NULL",
+        "text": "TEXT",
+        "sort": "INTEGER DEFAULT 0",
     },
     # ---- Erweiterung: Postfach, Kalender, Aufgaben, Push ----
     "mailkonten": {                                      # wie user_mail im Hub, Passwort liegt in secrets ("mailkonto:<id>")
@@ -358,6 +363,12 @@ def seed(conn):
                              "VALUES (?, ?, ?, ?, '', 1, ?)",
                              (p["name"], p["grundpreis_cent"], p["inkl_spieler"], p["zusatzspieler_cent"], p["sort"]))
         conn.execute("INSERT INTO settings (key, value) VALUES ('seed_pakete', ?)", (now_iso(),))
+    if not conn.execute("SELECT 1 FROM settings WHERE key='seed_vorlagen'").fetchone():
+        if not conn.execute("SELECT COUNT(*) FROM vorlagen").fetchone()[0]:
+            conn.execute("INSERT INTO vorlagen (name, text, sort) VALUES (?, ?, 1)", ("Galerie ist online (Beispiel, bitte anpassen)",
+                         "Hallo {name},\n\ndie Bilder vom Spiel {spiel} am {datum} sind online:\n{link}\n\n"
+                         "Der Link ist bis {ablauf} gültig.\n\nViele Grüße"))
+        conn.execute("INSERT INTO settings (key, value) VALUES ('seed_vorlagen', ?)", (now_iso(),))
 
 
 def row_dict(r):
@@ -680,14 +691,16 @@ def twofa_reset(username):
 # ---------------------------------------------------------------------------
 # Phase 2: Kunden, Kontakte, Pakete, Aufträge (allgemeine Tabellen-Schnittstelle wie api_table im Hub)
 # ---------------------------------------------------------------------------
-API_TABLES = ("kunden", "kontakte", "pakete", "auftraege", "zahlungen")
+API_TABLES = ("kunden", "kontakte", "pakete", "auftraege", "zahlungen", "lieferlinks", "vorlagen")
 ORDER = {"kunden": "name COLLATE NOCASE, id", "kontakte": "name COLLATE NOCASE, id", "pakete": "sort, id",
-         "auftraege": "datum, uhrzeit, id", "zahlungen": "auftrag_id, art = 'Zahlung', id"}
+         "auftraege": "datum, uhrzeit, id", "zahlungen": "auftrag_id, art = 'Zahlung', id",
+         "lieferlinks": "auftrag_id, erstellt_am, id", "vorlagen": "sort, id"}
 # Diese Felder setzt nur der Server (Preise, Fristen, Zeitstempel)
 SERVER_FIELDS = {
     "kunden": ("erstellt_am", "geaendert_am"),
     "kontakte": ("erstellt_am", "geaendert_am", "anonymisiert"),
     "zahlungen": ("erstellt_am", "geaendert_am"),
+    "lieferlinks": ("erstellt_am",),
     "auftraege": ("erstellt_am", "geaendert_am", "serie", "grundpreis_cent", "inkl_spieler", "zusatz_je_spieler_cent",
                   "anfahrt_frei_km", "anfahrt_cent_je_km", "zusatzspieler_cent", "anfahrt_cent", "lieferfrist"),
 }
@@ -773,6 +786,74 @@ def check_row(conn, table, row):
                 raise BadRequest("Bitte den Betrag der Anzahlung eingeben.")
             if a and row["betrag_cent"] > (a["betrag_cent"] or 0):
                 raise BadRequest("Die Anzahlung ist höher als der Betrag des Auftrags.")
+    if table == "lieferlinks":
+        if not row.get("auftrag_id"):
+            raise BadRequest("Der Link braucht einen Auftrag.")
+        # nur https: verhindert javascript:-Links und unverschlüsselte Galerien
+        if not re.fullmatch(r"https://[^\s<>\"']{3,490}", row.get("url") or ""):
+            raise BadRequest("Bitte den vollständigen Link eingeben, er muss mit https:// beginnen.")
+        if row.get("typ") not in LINK_TYPEN:
+            raise BadRequest("Unbekannter Link-Typ.")
+        if row.get("laeuft_ab_am"):
+            try:
+                date.fromisoformat(row["laeuft_ab_am"])
+            except ValueError:
+                raise BadRequest("Bitte ein gültiges Ablaufdatum eingeben.")
+    if table == "vorlagen" and (not row.get("name") or not row.get("text")):
+        raise BadRequest("Bitte Name und Text der Vorlage eingeben.")
+
+
+def lieferlink_vorbereiten(conn, vals, old):
+    """Der Auftrag eines Links steht fest. Picdrop-Links bekommen ohne Datum den Ablauf nach der Picdrop-Laufzeit."""
+    if old:
+        vals.pop("auftrag_id", None)
+        return
+    vals["typ"] = vals.get("typ") or "Picdrop"
+    if vals["typ"] == "Picdrop" and not vals.get("laeuft_ab_am"):
+        tage = int(get_setting(conn, "picdrop_tage") or 0)
+        vals["laeuft_ab_am"] = (date.fromisoformat(heute()) + timedelta(days=tage)).isoformat()
+
+
+def lieferampel(a, hat_link, tag):
+    """Lieferfrist-Ampel eines Auftrags am Tag tag (JJJJ-MM-TT):
+    gruen = geliefert (Link da oder Status Geliefert/Abgeschlossen), rot = Frist vorbei, gelb = Spiel war, Frist läuft,
+    keine = abgesagt, Spiel noch nicht gewesen oder keine Frist."""
+    if a["status"] == "Abgesagt":
+        return "keine"
+    if hat_link or a["status"] in ("Geliefert", "Abgeschlossen"):
+        return "gruen"
+    if not a.get("lieferfrist") or not a.get("datum") or tag < a["datum"]:
+        return "keine"
+    return "rot" if tag > a["lieferfrist"] else "gelb"
+
+
+def mit_ampel(conn, rows):
+    mit_link = {r[0] for r in conn.execute("SELECT DISTINCT auftrag_id FROM lieferlinks")}
+    tag = heute()
+    for d in rows:
+        d["ampel"] = lieferampel(d, d["id"] in mit_link, tag)
+    return rows
+
+
+def lieferung_uebersicht(conn, tag):
+    """Für die Seite Bildauslieferung: fällige und überfällige Aufträge, bald ablaufende und abgelaufene Links."""
+    kunden = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM kunden")}
+    auftraege = mit_ampel(conn, [row_dict(r) for r in conn.execute(
+        "SELECT * FROM auftraege WHERE IFNULL(archiviert, 0)=0 ORDER BY lieferfrist, id")])
+    for a in auftraege:
+        a["kunde"] = kunden.get(a["kunde_id"], "")
+    t = date.fromisoformat(tag)
+    bald, vorbei = (t + timedelta(days=7)).isoformat(), (t - timedelta(days=30)).isoformat()
+    links = [row_dict(r) for r in conn.execute(
+        "SELECT l.*, a.begegnung, a.datum, a.kunde_id FROM lieferlinks l JOIN auftraege a ON a.id = l.auftrag_id "
+        "WHERE l.laeuft_ab_am != '' AND l.laeuft_ab_am >= ? AND l.laeuft_ab_am <= ? ORDER BY l.laeuft_ab_am", (vorbei, bald))]
+    for l in links:
+        l["kunde"] = kunden.get(l["kunde_id"], "")
+    return {"heute": tag,
+            "ueberfaellig": [a for a in auftraege if a["ampel"] == "rot"],
+            "faellig": [a for a in auftraege if a["ampel"] == "gelb"],
+            "laeuft_ab": [l for l in links if l["laeuft_ab_am"] >= tag],
+            "abgelaufen": [l for l in links if l["laeuft_ab_am"] < tag]}
 
 
 def heute():
@@ -984,6 +1065,8 @@ def audit_label(table, r):
         return f"{datum_text(r['datum'])} {r['begegnung'] or ''}".strip()
     if table == "zahlungen":
         return f"{r['art']} zu Auftrag {r['auftrag_id']}"
+    if table == "lieferlinks":
+        return f"{r['typ']}-Link zu Auftrag {r['auftrag_id']}"
     return r["name"] or ""
 
 
@@ -1340,6 +1423,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return self.wfile.write(body)
+        if method == "GET" and p == ["lieferung"]:
+            with db() as conn:
+                return self.send_json(lieferung_uebersicht(conn, heute()))
         if method == "GET" and p == ["abrechnen"]:
             with db() as conn:
                 return self.send_json(abrechnen(conn))
@@ -1386,9 +1472,10 @@ class Handler(BaseHTTPRequestHandler):
             if rid is not None and not old:
                 return self.send_json({"error": "Diesen Eintrag gibt es nicht."}, 404)
             if method == "GET":
-                if old:
-                    return self.send_json(row_dict(old))
-                return self.send_json([row_dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY {ORDER[table]}")])
+                rows = [row_dict(r) for r in ([old] if old else conn.execute(f"SELECT * FROM {table} ORDER BY {ORDER[table]}"))]
+                if table == "auftraege":
+                    mit_ampel(conn, rows)
+                return self.send_json(rows[0] if old else rows)
 
             if (method == "POST" and rid is None) or (method == "PUT" and old):
                 vals = clean_values(table, self.read_json())
@@ -1396,6 +1483,8 @@ class Handler(BaseHTTPRequestHandler):
                     vals.pop(f, None)
                 if table == "zahlungen":
                     zahlung_vorbereiten(conn, vals, old)
+                if table == "lieferlinks":
+                    lieferlink_vorbereiten(conn, vals, old)
                 if not old:   # Vorgaben, damit die Prüfung auch beim Anlegen greift
                     for k, d in (("typ", "Verein"), ("status", "Angefragt")):
                         if k in cols and table in ("kunden", "auftraege") and not vals.get(k):
@@ -1424,10 +1513,19 @@ class Handler(BaseHTTPRequestHandler):
                     changes = {k: v for k, v in vals.items() if k not in AUDIT_SKIP and v not in (None, "")}
                 if table in ("auftraege", "zahlungen"):
                     zahlung_sync(conn, rid if table == "auftraege" else row["auftrag_id"])
+                if table == "lieferlinks" and not old:   # erster Link: der Auftrag gilt als geliefert
+                    a = conn.execute("SELECT * FROM auftraege WHERE id=?", (row["auftrag_id"],)).fetchone()
+                    if a and a["status"] in ("Angefragt", "Bestätigt", "Fotografiert"):
+                        conn.execute("UPDATE auftraege SET status='Geliefert', geaendert_am=? WHERE id=?", (now, a["id"]))
+                        audit(conn, user, "geändert", "auftraege", a["id"], audit_label("auftraege", a),
+                              {"status": [a["status"], "Geliefert"], "Grund": "Galerie-Link eingetragen"})
                 r = conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone()
                 if changes:
                     audit(conn, user, "geändert" if old else "neu", table, rid, audit_label(table, r), changes)
-                return self.send_json(row_dict(r), 200 if old else 201)
+                out = row_dict(r)
+                if table == "auftraege":
+                    mit_ampel(conn, [out])
+                return self.send_json(out, 200 if old else 201)
 
             if method == "DELETE" and old:
                 # Endgültig löschen geht nur, wenn nichts daran hängt: sonst meldet die Datenbank einen Fehler

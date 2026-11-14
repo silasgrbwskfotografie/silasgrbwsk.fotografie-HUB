@@ -3,7 +3,8 @@
 Interne Arbeitsoberfläche für Aufträge, Zahlungen, Bildauslieferung und Verträge.
 Regeln und Server: `CLAUDE.md`. Funktionsumfang und Bauphasen: `PLANUNG.md`.
 
-Stand: **Phase 3** (Zahlung und Anzahlung je Auftrag, Finom-Häkchen mit Rechnungsnummer, Liste "Noch in Finom abzurechnen", Umsatz je Monat und Kunde, CSV-Export).
+Stand: **Phase 4** (Bildauslieferung: Galerie-Links mit Ablaufdatum, Lieferfrist-Ampel, Nachrichtenvorlagen).
+Davor Phase 3: Zahlung und Anzahlung je Auftrag, Finom-Häkchen mit Rechnungsnummer, Liste "Noch in Finom abzurechnen", Umsatz je Monat und Kunde, CSV-Export.
 Davor Phase 2: Kunden, Kontakte, Aufträge mit Preisberechnung, Auftragsseite mit Duplizieren, Protokoll, Passwort ändern, nächtliche Sicherung.
 Davor Phase 1: Grundgerüst, Anmeldung mit Zwei-Faktor, Datenbank, Navigation.
 

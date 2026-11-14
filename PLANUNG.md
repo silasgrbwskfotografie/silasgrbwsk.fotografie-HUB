@@ -207,6 +207,8 @@ Regeln für die Umsetzung:
 - Entschieden am 14.11.2026 (Phase 3): Umsatz zählt nach Zahldatum, nur bezahlte Zahlungen. Bezahlt ohne Datum bekommt das heutige Datum.
 - Entschieden am 14.11.2026 (Phase 3): "Noch in Finom abzurechnen" zeigt nur bezahlte Zahlungen ohne Finom-Häkchen, Zahlung und Anzahlung getrennt.
 - Phase 3: Ein Auftrag lässt sich nur löschen, solange seine Zahlungen offen und nicht abgerechnet sind. Sonst archivieren.
+- Entschieden am 14.11.2026 (Phase 4): Ein Auftrag gilt als geliefert, sobald ein Galerie-Link eingetragen ist. Steht der Status noch auf Angefragt, Bestätigt oder Fotografiert, wechselt er auf Geliefert.
+- Phase 4: Lieferfrist-Ampel rot = Frist vorbei, gelb = Spiel war und Frist läuft, grün = geliefert. Galerie-Links nur mit https://.
 
 ## Technik und Architektur
 

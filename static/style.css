@@ -165,3 +165,14 @@ a.linkbtn{text-decoration:none}
 .balken{height:10px;border-radius:99px;background:var(--bg);overflow:hidden;margin:4px 0 6px}
 .balken span{display:block;height:100%;background:var(--ok)}
 .balken.warn span{background:var(--warn)}
+
+/* Phase 4: Bildauslieferung */
+.badge.bad{background:var(--bad-soft);color:var(--bad)}
+.row-head .badge,.tbl .badge{margin:0}
+.ampel{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.ampel.rot{background:var(--bad)}
+.ampel.gelb{background:var(--warn)}
+.ampel.gruen{background:var(--ok)}
+.link-zeile{padding:10px 0;border-bottom:1px solid var(--line)}
+.link-zeile .url{display:block;overflow-wrap:anywhere;margin:2px 0}
+#lNeu{margin-top:10px}
