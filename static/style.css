@@ -153,3 +153,15 @@ a.linkbtn{text-decoration:none}
   .tbl.karten .k-rest{grid-area:rest;overflow-wrap:anywhere}
   .tbl.karten.proto tr{grid-template-areas:"titel datum" "kunde kunde" "rest rest"}
 }
+
+/* Phase 3: Zahlungen */
+.zahl-zeile{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}
+.zahl-zeile .badge{margin:0 0 0 4px;vertical-align:middle}
+.zahl-zeile .btn{margin-top:4px}
+#anzNeu{margin-top:10px}
+.abrechnen{padding:10px 0;border-bottom:1px solid var(--line)}
+.abrechnen .num{margin-left:auto}
+.leistung{white-space:pre-wrap;font-family:inherit;font-size:13.5px;background:var(--bg);border-radius:9px;padding:8px 10px;margin:6px 0}
+.balken{height:10px;border-radius:99px;background:var(--bg);overflow:hidden;margin:4px 0 6px}
+.balken span{display:block;height:100%;background:var(--ok)}
+.balken.warn span{background:var(--warn)}

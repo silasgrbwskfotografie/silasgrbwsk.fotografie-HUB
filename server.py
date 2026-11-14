@@ -22,6 +22,8 @@ Konfiguration über Umgebungsvariablen (auf dem Server aus der .env):
 
 import base64
 import contextlib
+import csv
+import io
 import getpass
 import hashlib
 import hmac
@@ -37,10 +39,10 @@ import time
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
-VERSION = "0.3"
+VERSION = "0.4"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -135,8 +137,9 @@ TABLES = {
         "erstellt_am": "TEXT",
         "geaendert_am": "TEXT",
     },
-    "zahlungen": {
+    "zahlungen": {                                       # je Auftrag genau eine "Zahlung", dazu höchstens eine "Anzahlung"
         "auftrag_id": "INTEGER REFERENCES auftraege(id)",
+        "art": "TEXT DEFAULT 'Zahlung'",                 # Zahlung / Anzahlung
         "zahler_id": "INTEGER REFERENCES kontakte(id)",
         "betrag_cent": "INTEGER DEFAULT 0",
         "status": "TEXT DEFAULT 'Offen'",                # STATUS_ZAHLUNG
@@ -258,6 +261,7 @@ INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_auftraege_datum ON auftraege(datum)",
     "CREATE INDEX IF NOT EXISTS ix_auftraege_kunde ON auftraege(kunde_id)",
     "CREATE INDEX IF NOT EXISTS ix_zahlungen_auftrag ON zahlungen(auftrag_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_zahlungen_art ON zahlungen(auftrag_id, art)",
     "CREATE INDEX IF NOT EXISTS ix_lieferlinks_auftrag ON lieferlinks(auftrag_id)",
     "CREATE INDEX IF NOT EXISTS ix_kontakte_kunde ON kontakte(kunde_id)",
     "CREATE INDEX IF NOT EXISTS ix_vertraege_kunde ON vertraege(kunde_id)",
@@ -337,6 +341,10 @@ def init_db():
         for sql in INDEXES:
             conn.execute(sql)
         seed(conn)
+        # Aufträge ohne Zahlung (angelegt vor Phase 3) bekommen ihre offene Zahlung
+        for r in conn.execute("SELECT id FROM auftraege WHERE id NOT IN "
+                              "(SELECT auftrag_id FROM zahlungen WHERE art='Zahlung' AND auftrag_id IS NOT NULL)").fetchall():
+            zahlung_sync(conn, r["id"])
 
 
 def seed(conn):
@@ -672,13 +680,14 @@ def twofa_reset(username):
 # ---------------------------------------------------------------------------
 # Phase 2: Kunden, Kontakte, Pakete, Aufträge (allgemeine Tabellen-Schnittstelle wie api_table im Hub)
 # ---------------------------------------------------------------------------
-API_TABLES = ("kunden", "kontakte", "pakete", "auftraege")
+API_TABLES = ("kunden", "kontakte", "pakete", "auftraege", "zahlungen")
 ORDER = {"kunden": "name COLLATE NOCASE, id", "kontakte": "name COLLATE NOCASE, id", "pakete": "sort, id",
-         "auftraege": "datum, uhrzeit, id"}
+         "auftraege": "datum, uhrzeit, id", "zahlungen": "auftrag_id, art = 'Zahlung', id"}
 # Diese Felder setzt nur der Server (Preise, Fristen, Zeitstempel)
 SERVER_FIELDS = {
     "kunden": ("erstellt_am", "geaendert_am"),
     "kontakte": ("erstellt_am", "geaendert_am", "anonymisiert"),
+    "zahlungen": ("erstellt_am", "geaendert_am"),
     "auftraege": ("erstellt_am", "geaendert_am", "serie", "grundpreis_cent", "inkl_spieler", "zusatz_je_spieler_cent",
                   "anfahrt_frei_km", "anfahrt_cent_je_km", "zusatzspieler_cent", "anfahrt_cent", "lieferfrist"),
 }
@@ -748,6 +757,139 @@ def check_row(conn, table, row):
             raise BadRequest("Uhrzeit bitte als HH:MM.")
         if row.get("status") not in STATUS_AUFTRAG:
             raise BadRequest("Unbekannter Status.")
+    if table == "zahlungen":
+        if row.get("status") not in STATUS_ZAHLUNG:
+            raise BadRequest("Unbekannter Zahlstatus.")
+        if row.get("zahlart") and row["zahlart"] not in ZAHLARTEN:
+            raise BadRequest("Unbekannte Zahlart.")
+        if row.get("zahldatum"):
+            try:
+                date.fromisoformat(row["zahldatum"])
+            except ValueError:
+                raise BadRequest("Bitte ein gültiges Zahldatum eingeben.")
+        if row.get("art") == "Anzahlung":
+            a = conn.execute("SELECT betrag_cent FROM auftraege WHERE id=?", (row.get("auftrag_id"),)).fetchone()
+            if not row.get("betrag_cent"):
+                raise BadRequest("Bitte den Betrag der Anzahlung eingeben.")
+            if a and row["betrag_cent"] > (a["betrag_cent"] or 0):
+                raise BadRequest("Die Anzahlung ist höher als der Betrag des Auftrags.")
+
+
+def heute():
+    return datetime.now(TZ).date().isoformat()
+
+
+def zahlung_vorbereiten(conn, vals, old):
+    """Regeln für Zahlungen: Art und Auftrag stehen fest, der Betrag der Zahlung kommt aus dem Auftrag (abzüglich Anzahlung).
+    Neu angelegt werden kann nur die Anzahlung, die Zahlung selbst entsteht mit dem Auftrag."""
+    if old:
+        vals.pop("auftrag_id", None)
+        vals.pop("art", None)
+        if old["art"] == "Zahlung":
+            vals.pop("betrag_cent", None)
+    else:
+        if vals.get("art") != "Anzahlung":
+            raise BadRequest("Neu anlegen lässt sich nur eine Anzahlung. Die Zahlung entsteht mit dem Auftrag.")
+        if conn.execute("SELECT 1 FROM zahlungen WHERE auftrag_id=? AND art='Anzahlung'", (vals.get("auftrag_id"),)).fetchone():
+            raise BadRequest("Dieser Auftrag hat schon eine Anzahlung.")
+        vals.setdefault("status", "Offen")
+        vals["status"] = vals["status"] or "Offen"
+    status = vals.get("status", old["status"] if old else "Offen")
+    if status == "Bezahlt" and not vals.get("zahldatum", old["zahldatum"] if old else None):
+        vals["zahldatum"] = heute()   # Umsatz zählt nach Zahldatum, deshalb nie bezahlt ohne Datum
+
+
+def zahlung_sync(conn, auftrag_id):
+    """Die Zahlung eines Auftrags anlegen oder ihren Betrag nachziehen (Auftragsbetrag minus Anzahlung).
+    Nur solange sie offen ist: Bezahlte oder erlassene Beträge bleiben, wie sie sind."""
+    a = conn.execute("SELECT betrag_cent FROM auftraege WHERE id=?", (auftrag_id,)).fetchone()
+    if not a:
+        return
+    anz = conn.execute("SELECT betrag_cent FROM zahlungen WHERE auftrag_id=? AND art='Anzahlung'", (auftrag_id,)).fetchone()
+    soll = max(0, (a["betrag_cent"] or 0) - ((anz["betrag_cent"] or 0) if anz else 0))
+    z = conn.execute("SELECT id, status, betrag_cent FROM zahlungen WHERE auftrag_id=? AND art='Zahlung'", (auftrag_id,)).fetchone()
+    if not z:
+        conn.execute("INSERT INTO zahlungen (auftrag_id, art, betrag_cent, status, finom_abgerechnet, erstellt_am, geaendert_am) "
+                     "VALUES (?, 'Zahlung', ?, 'Offen', 0, ?, ?)", (auftrag_id, soll, now_iso(), now_iso()))
+    elif z["status"] == "Offen" and z["betrag_cent"] != soll:
+        conn.execute("UPDATE zahlungen SET betrag_cent=?, geaendert_am=? WHERE id=?", (soll, now_iso(), z["id"]))
+
+
+def umsatz(conn, jahr):
+    """Umsatz eines Jahres in Cent nach Zahldatum: je Monat und je Kunde. Zählt nur bezahlte Zahlungen."""
+    monate = [0] * 12
+    kunden = {}
+    for r in conn.execute("SELECT z.betrag_cent, z.zahldatum, k.name FROM zahlungen z JOIN auftraege a ON a.id = z.auftrag_id "
+                          "LEFT JOIN kunden k ON k.id = a.kunde_id WHERE z.status='Bezahlt' AND substr(z.zahldatum, 1, 4)=?",
+                          (str(jahr),)):
+        monate[int(r["zahldatum"][5:7]) - 1] += r["betrag_cent"] or 0
+        kunden[r["name"] or "ohne Kunde"] = kunden.get(r["name"] or "ohne Kunde", 0) + (r["betrag_cent"] or 0)
+    offen = conn.execute("SELECT COALESCE(SUM(z.betrag_cent), 0) FROM zahlungen z JOIN auftraege a ON a.id = z.auftrag_id "
+                         "WHERE z.status='Offen' AND a.status != 'Abgesagt'").fetchone()[0]
+    jahre = sorted({r[0] for r in conn.execute("SELECT DISTINCT substr(zahldatum, 1, 4) FROM zahlungen "
+                                                "WHERE status='Bezahlt' AND zahldatum != ''")} | {str(jahr), heute()[:4]}, reverse=True)
+    grenze = get_setting(conn, "umsatzgrenze_cent")
+    return {"jahr": int(jahr), "monate": monate, "summe": sum(monate), "offen": offen, "jahre": [int(j) for j in jahre],
+            "kunden": sorted(([k, v] for k, v in kunden.items()), key=lambda x: -x[1]),
+            "grenze": int(grenze) if grenze else None}
+
+
+def leistungstext(a, paket, z, anzahlung_cent):
+    """Kopierfertiger Text für die Rechnung in Finom. Mit von Hand festgelegtem Betrag ohne Aufschlüsselung,
+    weil die Einzelposten dann nicht zur Summe passen."""
+    titel = (paket["finom_text"] if paket else "") or (paket["name"] if paket else "") or "Fotografie"
+    kopf = ", ".join(x for x in (a["begegnung"], datum_text(a["datum"])) if x)
+    zeile = f"{titel}: {kopf}" if kopf else titel
+    if z["art"] == "Anzahlung":
+        return f"Anzahlung für {zeile}\nBetrag: {eur_text(z['betrag_cent'])}"
+    zeilen = [zeile]
+    if not a["betrag_manuell"]:
+        if a["zusatzspieler_cent"]:
+            n = max(0, (a["spieler"] or 0) - (a["inkl_spieler"] or 0))
+            zeilen.append(f"Zusatzspieler: {n} × {eur_text(a['zusatz_je_spieler_cent'])} = {eur_text(a['zusatzspieler_cent'])}")
+        if a["anfahrt_cent"]:
+            km = max(0, (a["km"] or 0) - (a["anfahrt_frei_km"] or 0))
+            zeilen.append(f"Anfahrt: {km} km × {eur_text(a['anfahrt_cent_je_km'])} = {eur_text(a['anfahrt_cent'])}")
+    if anzahlung_cent:
+        zeilen.append(f"abzüglich Anzahlung: {eur_text(anzahlung_cent)}")
+    zeilen.append(f"Betrag: {eur_text(z['betrag_cent'])}")
+    return "\n".join(zeilen)
+
+
+def abrechnen(conn):
+    """Bezahlte Zahlungen ohne Finom-Häkchen, mit Leistungstext."""
+    out = []
+    for z in conn.execute("SELECT * FROM zahlungen WHERE status='Bezahlt' AND IFNULL(finom_abgerechnet, 0)=0 "
+                          "ORDER BY zahldatum, id").fetchall():
+        a = conn.execute("SELECT * FROM auftraege WHERE id=?", (z["auftrag_id"],)).fetchone()
+        paket = conn.execute("SELECT * FROM pakete WHERE id=?", (a["paket_id"],)).fetchone()
+        kunde = conn.execute("SELECT name FROM kunden WHERE id=?", (a["kunde_id"],)).fetchone()
+        zahler = conn.execute("SELECT name FROM kontakte WHERE id=?", (z["zahler_id"],)).fetchone() if z["zahler_id"] else None
+        anz = conn.execute("SELECT betrag_cent FROM zahlungen WHERE auftrag_id=? AND art='Anzahlung'", (a["id"],)).fetchone()
+        out.append({**row_dict(z), "kunde": kunde["name"] if kunde else "", "zahler": zahler["name"] if zahler else "",
+                    "auftrag_datum": a["datum"], "begegnung": a["begegnung"] or "",
+                    "text": leistungstext(a, paket, z, (anz["betrag_cent"] or 0) if anz and z["art"] == "Zahlung" else 0)})
+    return out
+
+
+def csv_zelle(v):
+    """Schutz für Excel: Zellen, die mit = + - @ beginnen, würden sonst als Formel ausgeführt."""
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+
+
+def umsatz_csv(conn, jahr):
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
+    w.writerow(["Zahldatum", "Kunde", "Auftrag", "Datum Auftrag", "Art", "Zahler", "Zahlart", "Betrag", "Finom-Rechnung"])
+    for r in conn.execute("SELECT z.*, a.begegnung, a.datum, k.name AS kunde, c.name AS zahler FROM zahlungen z "
+                          "JOIN auftraege a ON a.id = z.auftrag_id LEFT JOIN kunden k ON k.id = a.kunde_id "
+                          "LEFT JOIN kontakte c ON c.id = z.zahler_id WHERE z.status='Bezahlt' AND substr(z.zahldatum, 1, 4)=? "
+                          "ORDER BY z.zahldatum, z.id", (str(jahr),)):
+        w.writerow([csv_zelle(x) for x in (datum_text(r["zahldatum"]), r["kunde"], r["begegnung"], datum_text(r["datum"]), r["art"],
+                                           r["zahler"], r["zahlart"], eur_text(r["betrag_cent"]).replace(" €", "").replace(".", ""),
+                                           r["finom_rechnungsnr"])])
+    return "\ufeff" + buf.getvalue()   # BOM, damit Excel die Umlaute erkennt
 
 
 def auftrag_preise(conn, row, old):
@@ -840,6 +982,8 @@ def backup_liste():
 def audit_label(table, r):
     if table == "auftraege":
         return f"{datum_text(r['datum'])} {r['begegnung'] or ''}".strip()
+    if table == "zahlungen":
+        return f"{r['art']} zu Auftrag {r['auftrag_id']}"
     return r["name"] or ""
 
 
@@ -1182,6 +1326,23 @@ class Handler(BaseHTTPRequestHandler):
                 with db() as conn:
                     audit(conn, user, "Sicherung erstellt", "", None, name.name)
             return self.send_json(backup_liste())
+        if method == "GET" and head == "umsatz" and p[1:] in ([], ["csv"]):
+            jahr = (parse_qs(urlparse(self.path).query).get("jahr") or [""])[0]
+            jahr = int(jahr) if re.fullmatch(r"20[0-9]{2}", jahr) else int(heute()[:4])
+            with db() as conn:
+                if not p[1:]:
+                    return self.send_json(umsatz(conn, jahr))
+                body = umsatz_csv(conn, jahr).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="umsatz-{jahr}.csv"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return self.wfile.write(body)
+        if method == "GET" and p == ["abrechnen"]:
+            with db() as conn:
+                return self.send_json(abrechnen(conn))
         if method == "POST" and p == ["auftraege", "vorschau"]:   # Preis für das Formular, speichert nichts
             data = self.read_json()
             vals = clean_values("auftraege", data)
@@ -1233,6 +1394,8 @@ class Handler(BaseHTTPRequestHandler):
                 vals = clean_values(table, self.read_json())
                 for f in SERVER_FIELDS.get(table, ()):
                     vals.pop(f, None)
+                if table == "zahlungen":
+                    zahlung_vorbereiten(conn, vals, old)
                 if not old:   # Vorgaben, damit die Prüfung auch beim Anlegen greift
                     for k, d in (("typ", "Verein"), ("status", "Angefragt")):
                         if k in cols and table in ("kunden", "auftraege") and not vals.get(k):
@@ -1259,6 +1422,8 @@ class Handler(BaseHTTPRequestHandler):
                     rid = conn.execute(f"INSERT INTO {table} ({', '.join(vals)}) VALUES ({', '.join('?' for _ in vals)})",
                                        list(vals.values())).lastrowid
                     changes = {k: v for k, v in vals.items() if k not in AUDIT_SKIP and v not in (None, "")}
+                if table in ("auftraege", "zahlungen"):
+                    zahlung_sync(conn, rid if table == "auftraege" else row["auftrag_id"])
                 r = conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone()
                 if changes:
                     audit(conn, user, "geändert" if old else "neu", table, rid, audit_label(table, r), changes)
@@ -1269,7 +1434,19 @@ class Handler(BaseHTTPRequestHandler):
                 # (IntegrityError, siehe handle_request) und alles wird zurückgerollt.
                 if table == "kunden":
                     conn.execute("DELETE FROM kontakte WHERE kunde_id=?", (rid,))
+                if table == "auftraege":   # nur, solange keine Zahlung erfasst ist: die offenen Zahlungen gehen mit
+                    if conn.execute("SELECT 1 FROM zahlungen WHERE auftrag_id=? AND (status != 'Offen' OR IFNULL(finom_abgerechnet, 0))",
+                                    (rid,)).fetchone():
+                        raise BadRequest("Zu diesem Auftrag ist schon eine Zahlung erfasst. Bitte archivieren statt löschen.")
+                    conn.execute("DELETE FROM zahlungen WHERE auftrag_id=?", (rid,))
+                if table == "zahlungen":
+                    if old["art"] != "Anzahlung":
+                        raise BadRequest("Die Zahlung gehört zum Auftrag und lässt sich nicht einzeln löschen.")
+                    if old["status"] != "Offen" or old["finom_abgerechnet"]:
+                        raise BadRequest("Nur eine offene Anzahlung lässt sich löschen. Sonst bitte den Status ändern.")
                 conn.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
+                if table == "zahlungen":
+                    zahlung_sync(conn, old["auftrag_id"])
                 audit(conn, user, "gelöscht", table, rid, audit_label(table, old),
                       {k: v for k, v in row_dict(old).items() if k not in AUDIT_SKIP and v not in (None, "")})
                 return self.send_json({"ok": True})

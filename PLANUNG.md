@@ -203,6 +203,10 @@ Regeln für die Umsetzung:
 - Entschieden am 14.11.2026 (Phase 2): Ändern sich bei einem bestehenden Auftrag Kilometer oder Spielerzahl, wird mit den Preisen vom Anlegen gerechnet. Nur ein Paketwechsel holt die aktuellen Preise des neuen Pakets. Von Hand gesetzte Beträge bleiben stehen.
 - Entschieden am 14.11.2026 (Phase 2): Kunden und Aufträge werden archiviert. Endgültig löschen geht nur, wenn nichts daran hängt (Kunde ohne Aufträge, Auftrag ohne Zahlung, Kontakt nicht als Zahler, Paket ohne Aufträge).
 - Entschieden am 14.11.2026 (Phase 2): Sportart ist ein freies Textfeld, bereits benutzte Sportarten werden vorgeschlagen.
+- Entschieden am 14.11.2026 (Phase 3): Jeder Auftrag hat genau eine Zahlung, dazu optional eine Anzahlung. Die Zahlung entsteht mit dem Auftrag, ihr Betrag ist Auftragsbetrag minus Anzahlung und zieht nach, solange sie offen ist.
+- Entschieden am 14.11.2026 (Phase 3): Umsatz zählt nach Zahldatum, nur bezahlte Zahlungen. Bezahlt ohne Datum bekommt das heutige Datum.
+- Entschieden am 14.11.2026 (Phase 3): "Noch in Finom abzurechnen" zeigt nur bezahlte Zahlungen ohne Finom-Häkchen, Zahlung und Anzahlung getrennt.
+- Phase 3: Ein Auftrag lässt sich nur löschen, solange seine Zahlungen offen und nicht abgerechnet sind. Sonst archivieren.
 
 ## Technik und Architektur
 

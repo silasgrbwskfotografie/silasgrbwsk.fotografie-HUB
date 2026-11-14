@@ -92,7 +92,6 @@ function head(title, sub) {
 
 /* Seiten, die in späteren Phasen gebaut werden */
 const LATER = {
-  zahlungen: [3, 'Zahlstatus, Zahler, Finom-Häkchen mit Rechnungsnummer, Umsatz und CSV-Export.'],
   lieferung: [4, 'Galerie-Links mit Ablaufdatum, Lieferfrist-Ampel und Nachrichtenvorlagen.'],
   vertraege: [5, 'Verträge mit Fristen, PDF-Upload und geschütztem Download.'],
   mail: [9, 'Postfach wie im Emden Tigers Hub, mit mehreren Konten.'],
@@ -113,7 +112,7 @@ App.pages.start = async (view) => {
   view.innerHTML = head('Hallo ' + (App.me.display_name || App.me.username), 'Heute ist der ' + datum(iso))
     + `<div class="grid g2">
       <div class="card"><h2>Stand</h2>
-        <p>Phase 2 ist eingerichtet: Kunden, Kontakte und Aufträge mit Preisberechnung.</p>
+        <p>Phase 3 ist eingerichtet: Kunden, Aufträge mit Preisberechnung und Zahlungen mit Umsatz.</p>
         <p class="muted small">Termine, Lieferungen, offene Zahlungen und Umsatz erscheinen hier ab Phase 6.</p></div>
       <div class="card"><h2>Pakete</h2>${paketTabelle(pakete)}
         <p class="muted small">Anfahrt: ${esc(s.anfahrt_frei_km)} km frei, danach ${euro(s.anfahrt_cent_je_km)} je km.</p></div>

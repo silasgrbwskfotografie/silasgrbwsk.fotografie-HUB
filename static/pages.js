@@ -49,14 +49,14 @@ function readForm(form, fields) {
 }
 
 /* Dialog zum Anlegen und Bearbeiten. opts: fix (feste Werte), extra (HTML unter den Feldern), bind(form),
-   danach(was, gespeichert) statt Neuzeichnen der Seite. was: 'save' | 'arch' | 'del' */
+   danach(was, gespeichert) statt Neuzeichnen der Seite. was: 'save' | 'arch' | 'del'. ohneLoeschen: kein Löschknopf */
 function editRecord(table, title, fields, rec = {}, opts = {}) {
   const dlg = $('#modal');
   const archivierbar = rec.id && 'archiviert' in rec;
   dlg.innerHTML = `<form class="modal-box"><h2>${esc(title)}</h2>
     <div class="form-grid">${fields.map(f => fieldHtml(f, rec[f.key] ?? f.def)).join('')}</div>${opts.extra || ''}
     <div class="modal-foot"><span class="btn-row">
-      ${rec.id ? '<button type="button" class="btn danger" data-act="del">Löschen</button>' : ''}
+      ${rec.id && !opts.ohneLoeschen ? '<button type="button" class="btn danger" data-act="del">Löschen</button>' : ''}
       ${archivierbar ? `<button type="button" class="btn" data-act="arch">${rec.archiviert ? 'Wiederherstellen' : 'Archivieren'}</button>` : ''}
     </span><span class="btn-row"><button type="button" class="btn" data-act="close">Abbrechen</button>
       <button class="btn primary">Speichern</button></span></div></form>`;
@@ -237,8 +237,10 @@ App.pages.auftraege = async (view) => {
 
 /* ---------- Ein Auftrag: alles an einer Stelle (#/auftrag/<id>) ---------- */
 App.pages.auftrag = async (view, id) => {
-  const [a, auftraege, kunden, pakete, kontakte] = await Promise.all(
-    [api('auftraege/' + Number(id)), api('auftraege'), api('kunden'), api('pakete'), api('kontakte')]);
+  const [a, auftraege, kunden, pakete, kontakte, alleZahlungen] = await Promise.all(
+    [api('auftraege/' + Number(id)), api('auftraege'), api('kunden'), api('pakete'), api('kontakte'), api('zahlungen')]);
+  const zs = alleZahlungen.filter(z => z.auftrag_id === a.id);
+  const zSumme = zs.reduce((sum, z) => sum + z.betrag_cent, 0);
   const kunde = byId(kunden, a.kunde_id) || {};
   const zusatzN = a.inkl_spieler ? Math.max(0, (a.spieler || 0) - a.inkl_spieler) : 0;
   const kmN = Math.max(0, (a.km || 0) - a.anfahrt_frei_km);
@@ -267,7 +269,11 @@ App.pages.auftrag = async (view, id) => {
         <span class="muted small">${esc(c.rolle || '')}</span><br>${[c.telefon && `<a href="tel:${esc(c.telefon)}">${esc(c.telefon)}</a>`,
           c.email && `<a href="mailto:${esc(c.email)}">${esc(c.email)}</a>`, esc(c.instagram || '')].filter(Boolean).join(' · ')}</li>`).join('')}</ul>`
         : '<p class="muted">Bei diesem Kunden ist noch kein Kontakt hinterlegt.</p>'}</div>
-      <div class="card"><h2>Zahlung und Bilder</h2><p class="muted small">Zahlung (Phase 3) und Galerie-Links mit Fristen (Phase 4) erscheinen hier, sobald sie gebaut sind.</p></div>
+      <div class="card"><h2>Zahlung</h2><div id="zListe">${zs.map(z => zahlungZeile(z, kontakte)).join('')}</div>
+        ${zSumme !== a.betrag_cent && a.status !== 'Abgesagt' ? `<p class="warnline small">Die Zahlungen ergeben ${euro(zSumme)}, der Auftrag ${euro(a.betrag_cent)}.
+          Bezahlte und erlassene Beträge passen sich nicht mehr an. Bitte prüfen.</p>` : ''}
+        ${zs.some(z => z.art === 'Anzahlung') ? '' : '<button type="button" class="btn sm" id="anzNeu">Anzahlung hinzufügen</button>'}</div>
+      <div class="card"><h2>Bilder</h2><p class="muted small">Galerie-Links mit Fristen erscheinen hier ab Phase 4.</p></div>
     </div>`;
   const d = { auftraege, kunden, pakete };
   $('#aEdit').addEventListener('click', () => auftragDialog(a, d, { danach: (was) => { if (was === 'del') location.hash = '#/auftraege'; else router(); } }));
@@ -277,6 +283,107 @@ App.pages.auftrag = async (view, id) => {
     { titel: 'Auftrag duplizieren', danach: (was, r) => { location.hash = '#/auftrag/' + r.id; } }));
   $('#aStat').addEventListener('change', async (ev) => {
     try { await api('auftraege/' + a.id, 'PUT', { status: ev.target.value }); toast('Status: ' + ev.target.value); } catch (e) { toast(e.message); }
+  });
+  $('#zListe').addEventListener('click', (ev) => {
+    const zid = ev.target.closest('button')?.dataset.zahlung;
+    if (zid) zahlungDialog(byId(zs, zid), kontakte, kunden, a.kunde_id);
+  });
+  $('#anzNeu')?.addEventListener('click', () => zahlungDialog({ art: 'Anzahlung', status: 'Offen' }, kontakte, kunden, a.kunde_id,
+    { fix: { auftrag_id: a.id, art: 'Anzahlung' } }));
+};
+
+/* ---------- Zahlungen: Bausteine ---------- */
+const STATUS_ZAHLUNG = ['Offen', 'Bezahlt', 'Erlassen'];
+const ZAHLARTEN = ['Bar', 'Überweisung', 'PayPal'];
+const zahlBadge = st => `<span class="badge ${st === 'Bezahlt' ? 'ok' : st === 'Offen' ? 'warn' : 'plain'}">${esc(st)}</span>`;
+
+function zahlungZeile(z, kontakte) {
+  const zahler = z.zahler_id ? byId(kontakte, z.zahler_id)?.name : '';
+  const info = [z.status === 'Bezahlt' && z.zahldatum ? 'am ' + datum(z.zahldatum) : '', z.zahlart, zahler ? 'von ' + zahler : '',
+    z.finom_abgerechnet ? 'Finom' + (z.finom_rechnungsnr ? ' ' + z.finom_rechnungsnr : '') : ''].filter(Boolean);
+  return `<div class="zahl-zeile"><div><b>${esc(z.art)}</b> ${zahlBadge(z.status)}<br>
+    <span class="muted small">${info.map(esc).join(' · ') || 'noch nichts erfasst'}</span></div>
+    <div class="num"><b>${euro(z.betrag_cent)}</b><br><button type="button" class="btn sm" data-zahlung="${z.id}">Erfassen</button></div></div>`;
+}
+
+/* Dialog für Zahlung oder Anzahlung. Zahler: zuerst die Kontakte des Kunden, dann alle anderen (bei der HSG zahlt oft ein Spieler). */
+function zahlungDialog(z, kontakte, kunden, kundeId, opts = {}) {
+  const eigene = kontakte.filter(c => c.kunde_id === kundeId);
+  const andere = kontakte.filter(c => c.kunde_id !== kundeId).map(c => [c.id, `${c.name} (${byId(kunden, c.kunde_id)?.name || ''})`]);
+  const felder = [
+    ...(z.art === 'Anzahlung' ? [{ key: 'betrag_cent', label: 'Betrag der Anzahlung in Euro', type: 'euro', required: true }] : []),
+    { key: 'status', label: 'Status', type: 'select', options: STATUS_ZAHLUNG.map(x => [x, x]) },
+    { key: 'zahldatum', label: 'Zahldatum (leer: heute, wenn bezahlt)', type: 'date' },
+    { key: 'zahlart', label: 'Zahlart', type: 'select', options: [['', 'noch offen']].concat(ZAHLARTEN.map(x => [x, x])) },
+    { key: 'zahler_id', label: 'Zahler', type: 'select', options: [['', 'nicht festgelegt']].concat(eigene.map(c => [c.id, c.name]), andere) },
+    { key: 'finom_abgerechnet', label: 'In Finom abgerechnet', type: 'check' },
+    { key: 'finom_rechnungsnr', label: 'Finom-Rechnungsnummer' },
+    { key: 'notizen', label: 'Notizen', type: 'textarea', full: true },
+  ];
+  const titel = z.id ? `${z.art} erfassen (${euro(z.betrag_cent)})` : 'Anzahlung hinzufügen';
+  editRecord('zahlungen', titel, felder, z, { ...opts, ohneLoeschen: z.art !== 'Anzahlung',
+    extra: z.art === 'Zahlung' ? '<p class="muted small">Der Betrag kommt aus dem Auftrag, abzüglich einer Anzahlung. Ändern lässt er sich im Auftrag.</p>' : '' });
+}
+
+/* ---------- Zahlungen: offen, noch abzurechnen, Umsatz ---------- */
+App.pages.zahlungen = async (view) => {
+  const jahr = Filter.uJahr || new Date().getFullYear();
+  const [zahlungen, auftraege, kunden, kontakte, abr, u] = await Promise.all(
+    [api('zahlungen'), api('auftraege'), api('kunden'), api('kontakte'), api('abrechnen'), api('umsatz?jahr=' + jahr)]);
+  const auftrag = id => byId(auftraege, id) || {};
+  const offen = zahlungen.filter(z => z.status === 'Offen' && auftrag(z.auftrag_id).status !== 'Abgesagt')
+    .sort((x, y) => (auftrag(x.auftrag_id).datum || '').localeCompare(auftrag(y.auftrag_id).datum || ''));
+  const titel = a => `<a class="linkbtn" href="#/auftrag/${a.id}"><b>${esc(a.begegnung || 'ohne Titel')}</b></a>`;
+  const MONATE = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
+  const anteil = u.grenze ? Math.round(u.summe / u.grenze * 100) : null;
+
+  view.innerHTML = head('Zahlungen', 'Offene Beträge, Abrechnung in Finom und Umsatz')
+    + `<div class="grid g2">
+      <div class="card"><h2>Offen: ${euro(offen.reduce((sum, z) => sum + z.betrag_cent, 0))}</h2>
+        ${offen.length ? `<table class="tbl"><tbody>${offen.map(z => { const a = auftrag(z.auftrag_id); return `<tr>
+          <td class="nowrap">${datum(a.datum)}</td><td>${titel(a)}<br><span class="muted small">${esc(byId(kunden, a.kunde_id)?.name || '')}${z.art === 'Anzahlung' ? ' · Anzahlung' : ''}</span></td>
+          <td class="num">${euro(z.betrag_cent)}<br><button type="button" class="btn sm" data-zahlung="${z.id}">Erfassen</button></td></tr>`; }).join('')}</tbody></table>`
+          : '<p class="muted">Keine offenen Zahlungen.</p>'}</div>
+      <div class="card"><h2>Noch in Finom abzurechnen</h2>
+        ${abr.length ? abr.map(x => `<div class="abrechnen">
+          <div class="row-head"><b>${esc(x.kunde)}</b><span class="muted small">${esc(x.art)}, bezahlt am ${datum(x.zahldatum)}${x.zahler ? ', von ' + esc(x.zahler) : ''}</span>
+            <span class="num"><b>${euro(x.betrag_cent)}</b></span></div>
+          <pre class="leistung">${esc(x.text)}</pre>
+          <form class="btn-row" data-finom="${x.id}"><button type="button" class="btn sm" data-copy="${x.id}">Text kopieren</button>
+            <input class="input sm" name="nr" placeholder="Rechnungsnummer" aria-label="Finom-Rechnungsnummer">
+            <button class="btn sm primary">Abgerechnet</button></form></div>`).join('')
+          : '<p class="muted">Alles abgerechnet. Hier erscheinen bezahlte Zahlungen ohne Finom-Häkchen.</p>'}</div>
+      <div class="card"><h2>Umsatz ${jahr}</h2>
+        <div class="toolbar"><select class="input sm" id="uJahr" aria-label="Jahr">${u.jahre.map(j => `<option${j === jahr ? ' selected' : ''}>${j}</option>`).join('')}</select>
+          <a class="btn sm" href="/api/umsatz/csv?jahr=${jahr}" download>CSV herunterladen</a></div>
+        <p>Bezahlt im Jahr ${jahr}: <b>${euro(u.summe)}</b></p>
+        ${anteil === null ? '<p class="muted small">Umsatzgrenze ist noch nicht festgelegt (Einstellungen).</p>'
+          : `<div class="balken${anteil >= 80 ? ' warn' : ''}"><span></span></div>
+            <p class="muted small">${anteil} % der Grenze von ${euro(u.grenze)} aus den Einstellungen. Welche Regel für dich gilt, klärst du mit der Steuerberatung.</p>`}
+        <table class="tbl"><thead><tr><th>Monat</th><th class="num">Betrag</th></tr></thead><tbody>
+          ${u.monate.map((c, i) => `<tr${c ? '' : ' class="muted"'}><td>${MONATE[i]}</td><td class="num">${euro(c)}</td></tr>`).join('')}</tbody></table>
+        <p class="muted small">Gezählt wird nach Zahldatum, nur bezahlte Zahlungen.</p></div>
+      <div class="card"><h2>Umsatz ${jahr} je Kunde</h2>
+        ${u.kunden.length ? `<table class="tbl"><tbody>${u.kunden.map(([k, c]) => `<tr><td>${esc(k)}</td><td class="num">${euro(c)}</td></tr>`).join('')}</tbody></table>`
+          : '<p class="muted">Noch kein Umsatz in diesem Jahr.</p>'}</div>
+    </div>`;
+  // Breite des Balkens per JS: die CSP erlaubt keine style-Attribute im HTML
+  $$('.balken span', view).forEach(el => { el.style.width = Math.min(100, anteil) + '%'; });
+  $('#uJahr').addEventListener('change', (ev) => { Filter.uJahr = Number(ev.target.value); router(); });
+  view.addEventListener('click', async (ev) => {
+    const d = ev.target.closest('button')?.dataset || {};
+    if (d.zahlung) { const z = byId(zahlungen, d.zahlung); zahlungDialog(z, kontakte, kunden, auftrag(z.auftrag_id).kunde_id); }
+    if (d.copy) copyText(byId(abr, d.copy).text);
+  });
+  view.addEventListener('submit', async (ev) => {
+    const id = ev.target.dataset.finom;
+    if (!id) return;
+    ev.preventDefault();
+    try {
+      await api('zahlungen/' + id, 'PUT', { finom_abgerechnet: 1, finom_rechnungsnr: ev.target.elements.nr.value.trim() });
+      toast('Als abgerechnet markiert');
+      router();
+    } catch (e) { toast(e.message); }
   });
 };
 
