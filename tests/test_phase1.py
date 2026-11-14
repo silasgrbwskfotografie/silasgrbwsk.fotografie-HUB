@@ -142,6 +142,7 @@ class Phase1(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", r.getheader("Content-Security-Policy"))
         self.assertEqual(r.getheader("X-Robots-Tag"), "noindex, nofollow")
         self.assertEqual(r.getheader("X-Frame-Options"), "DENY")
+        self.assertIn("geolocation=(self)", r.getheader("Permissions-Policy"))
 
     def test_pfad_ausbruch(self):
         c = Client(self.port)

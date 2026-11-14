@@ -2422,6 +2422,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("X-Robots-Tag", "noindex, nofollow")
+        # eigene Regel, sonst setzt Caddy geolocation=() und das GPS im Fahrtenbuch ginge nicht
+        self.send_header("Permissions-Policy", "geolocation=(self), camera=(), microphone=(), interest-cohort=()")
         # Nur eigene Skripte, Stile und Bilder. Keine Inline-Skripte, keine fremden Quellen.
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; "
                                                     "img-src 'self' data: https://tile.openstreetmap.org; "
