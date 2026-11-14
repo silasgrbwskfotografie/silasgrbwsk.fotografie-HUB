@@ -37,13 +37,18 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from zoneinfo import ZoneInfo
 
-VERSION = "0.7"
+import webpush
+from webpush import b64u, b64u_dec, ec_pub_point, push_endpoint_ok
+
+VERSION = "0.8"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -261,6 +266,7 @@ TABLES = {
         "auth": "TEXT",
         "geraet": "TEXT",
         "angelegt_am": "TEXT",
+        "zuletzt_ok": "TEXT",
     },
 }
 
@@ -1351,6 +1357,74 @@ def serie_anlegen(conn, data, user):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Push-Mitteilungen (wie send_push im Hub). Ein Nutzer, also gehen sie an alle angemeldeten Geräte.
+# Inhalt nur Titel und kurzer Text, der Service Worker speichert nichts.
+# ---------------------------------------------------------------------------
+def vapid_keys(conn):
+    raw = secret_get(conn, "vapid_d")
+    if not raw:
+        d, _ = webpush.ec_keypair()
+        raw = format(d, "064x")
+        secret_set(conn, "vapid_d", raw)
+    d = int(raw, 16)
+    return d, webpush.ec_pub_bytes(webpush._ec_mul(d, webpush._EC_G))
+
+
+def badge_zahl(conn):
+    """Zahl am App-Symbol: überfällige und heute fällige Aufgaben plus neue Mails."""
+    aufgaben = conn.execute("SELECT COUNT(*) FROM aufgaben WHERE status != 'Erledigt' AND faellig != '' AND faellig <= ?",
+                            (heute(),)).fetchone()[0]
+    mails = conn.execute("SELECT COUNT(*) FROM mail_eingang WHERE status='neu'").fetchone()[0]
+    return aufgaben + mails
+
+
+def push_send_one(sub, payload, d, pub, contact):
+    u = urlparse(sub["endpoint"])
+    claims = {"aud": f"{u.scheme}://{u.netloc}", "exp": int(time.time()) + 12 * 3600, "sub": contact}
+    head = b64u(json.dumps({"typ": "JWT", "alg": "ES256"}, separators=(",", ":")).encode()) + "." + \
+        b64u(json.dumps(claims, separators=(",", ":")).encode())
+    jwt = head + "." + b64u(webpush.ec_sign(d, head.encode()))
+    body = webpush.webpush_encrypt(b64u_dec(sub["p256dh"]), b64u_dec(sub["auth"]), json.dumps(payload, ensure_ascii=False).encode())
+    req = urllib.request.Request(sub["endpoint"], data=body, method="POST", headers={
+        "Authorization": f"vapid t={jwt}, k={b64u(pub)}", "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream",
+        "TTL": "86400", "Urgency": "high"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:  # noqa
+        return 0
+
+
+def send_push(title, body, url="/", tag="studio", kind="show"):
+    """Push an alle Geräte. Abgelaufene Abos (404/410) werden entfernt. Rückgabe: Zahl erfolgreicher Zustellungen."""
+    with db() as conn:
+        subs = conn.execute("SELECT * FROM push_abos").fetchall()
+        if not subs:
+            return 0
+        d, pub = vapid_keys(conn)
+        badge = badge_zahl(conn)
+    contact = SITE_URL if SITE_URL.startswith("https://") else "mailto:studio-tool@example.invalid"
+    payload = {"title": str(title)[:120], "body": str(body)[:300], "url": url if str(url).startswith("/") else "/",
+               "tag": str(tag)[:60], "type": kind, "badge": badge}
+    ok = 0
+    for row in subs:
+        st = push_send_one(row, payload, d, pub, contact)
+        with db() as conn:
+            if st in (404, 410):
+                conn.execute("DELETE FROM push_abos WHERE id=?", (row["id"],))
+            elif 200 <= st < 300:
+                ok += 1
+                conn.execute("UPDATE push_abos SET zuletzt_ok=? WHERE id=?", (now_iso(), row["id"]))
+    return ok
+
+
+def send_push_async(*a, **kw):
+    threading.Thread(target=lambda: send_push(*a, **kw), daemon=True).start()
+
+
 class _Discard:
     """Bei HEAD-Anfragen: Inhalt verwerfen, Leeren und Schließen an die echte Verbindung weitergeben."""
     def __init__(self, real):
@@ -1368,7 +1442,7 @@ class PayloadTooLarge(Exception):
 
 
 # Öffentlich erreichbare Dateien (Anmeldeseite). Alles andere unter /static nur mit Sitzung.
-PUBLIC_STATIC = {"style.css", "login.js", "icon.svg", "logo.png"}
+PUBLIC_STATIC = {"style.css", "login.js", "icon.svg", "logo.png", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1411,6 +1485,8 @@ class Handler(BaseHTTPRequestHandler):
         ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         if path.suffix == ".js":
             ctype = "text/javascript"
+        if path.suffix == ".webmanifest":
+            ctype = "application/manifest+json"
         data = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", ctype + ("; charset=utf-8" if ctype.startswith("text/") else ""))
@@ -1548,6 +1624,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.wfile.write(body)
         if method == "GET" and head == "static" and len(p) == 2 and p[1] in PUBLIC_STATIC:
             return self.serve_under(STATIC, p[1:])
+        if method == "GET" and p in (["manifest.webmanifest"], ["sw.js"]):   # App auf dem Home-Bildschirm, ohne Anmeldung abrufbar
+            return self.send_file(STATIC / p[0])
         if method == "GET" and p == ["favicon.ico"]:
             return self.serve_under(STATIC, ["icon.svg"])
         if method == "GET" and p == ["login"]:
@@ -1708,6 +1786,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.wfile.write(body)
         if head == "datei" and len(p) == 3 and p[1] in DATEI_TABELLEN and re.fullmatch(r"[0-9]{1,9}", p[2]):
             return self.api_datei(method, p[1], int(p[2]), user)
+        if head == "push":
+            return self.api_push(method, p[1:])
+        if method == "GET" and p == ["badge"]:
+            with db() as conn:
+                return self.send_json({"badge": badge_zahl(conn)})
         if method == "GET" and p == ["dashboard"]:
             with db() as conn:
                 return self.send_json(dashboard(conn, heute()))
@@ -1819,6 +1902,36 @@ class Handler(BaseHTTPRequestHandler):
                       {k: v for k, v in row_dict(old).items() if k not in AUDIT_SKIP and v not in (None, "")})
                 return self.send_json({"ok": True})
         return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+
+    # -- Push-Abos dieses Geräts (/api/push/...) ---------------------------
+    def api_push(self, method, p):
+        sub = p[0] if p else ""
+        with db() as conn:
+            if method == "GET" and sub == "key":
+                _, pub = vapid_keys(conn)
+                return self.send_json({"key": b64u(pub), "geraete": conn.execute("SELECT COUNT(*) FROM push_abos").fetchone()[0]})
+            if method == "POST" and sub == "subscribe":
+                data = self.read_json()
+                ep, keys = str(data.get("endpoint") or ""), data.get("keys") or {}
+                if not push_endpoint_ok(ep):
+                    raise BadRequest("Dieser Push-Dienst wird nicht unterstützt.")
+                try:
+                    ec_pub_point(b64u_dec(keys.get("p256dh")))
+                    if len(b64u_dec(keys.get("auth"))) != 16:
+                        raise ValueError
+                except (ValueError, TypeError, AttributeError):
+                    raise BadRequest("Ungültiges Push-Abo.")
+                conn.execute("DELETE FROM push_abos WHERE endpoint=?", (ep,))
+                conn.execute("INSERT INTO push_abos (endpoint, p256dh, auth, geraet, angelegt_am) VALUES (?, ?, ?, ?, ?)",
+                             (ep, keys["p256dh"], keys["auth"], (self.headers.get("User-Agent") or "")[:200], now_iso()))
+                return self.send_json({"ok": True})
+            if method == "POST" and sub == "unsubscribe":
+                conn.execute("DELETE FROM push_abos WHERE endpoint=?", (str(self.read_json().get("endpoint") or ""),))
+                return self.send_json({"ok": True})
+        if method == "POST" and sub == "test":
+            n = send_push("Studio-Tool", "Push-Mitteilungen funktionieren.", "/#/einstellungen", "test")
+            return self.send_json({"ok": n > 0, "zugestellt": n})
+        return self.send_json({"error": "Unbekannte Schnittstelle"}, 404)
 
     # -- Kalender-Abo (öffentlich, nur mit dem geheimen Link) -------------
     def ics_abo(self, tok):

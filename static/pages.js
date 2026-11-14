@@ -566,7 +566,9 @@ App.pages.einstellungen = async (view) => {
         <p class="muted small">Jede Nacht entsteht automatisch eine Kopie der Datenbank im Ordner data/backups. Behalten werden 14 Tagesstände und 6 Monatsstände.
           Die Kopien liegen auf demselben Rechner wie das Tool, die Ablage außerhalb folgt in Phase 6.</p>
         <button type="button" class="btn sm" id="sichNeu">Jetzt sichern</button></div>
+      <div class="card" id="pushCard"></div>
     </div>`;
+  pushKarte($('#pushCard'));
   $('#sichNeu').addEventListener('click', async () => {
     try { await api('sicherungen', 'POST', {}); toast('Sicherung erstellt'); router(); } catch (e) { toast(e.message); }
   });
@@ -809,3 +811,73 @@ App.pages.kalender = async (view, ...rest) => {
   });
   if (App.kalenderExtra) App.kalenderExtra(view, { y, mo, start, ende });
 };
+
+/* ---------- App auf dem Home-Bildschirm und Push (nach dem Vorbild des Hubs) ---------- */
+/* iPhone: Push geht nur, wenn das Tool als App auf dem Home-Bildschirm liegt (ab iOS 16.4) */
+const istApp = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const istIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+const pushMoeglich = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+async function swReg() { return navigator.serviceWorker.getRegistration('/') || navigator.serviceWorker.register('/sw.js', { scope: '/' }); }
+async function pushAbo() { try { const r = await swReg(); return r ? await r.pushManager.getSubscription() : null; } catch { return null; } }
+async function pushEin() {
+  if (!pushMoeglich()) throw new Error(istIOS() && !istApp() ? 'Auf dem iPhone gehen Mitteilungen nur, wenn das Studio-Tool als App auf dem Home-Bildschirm liegt: in Safari "Teilen", dann "Zum Home-Bildschirm", und das Tool von dort öffnen.' : 'Dieser Browser unterstützt keine Push-Mitteilungen.');
+  if (await Notification.requestPermission() !== 'granted') throw new Error('Mitteilungen wurden nicht erlaubt. Das lässt sich in den Einstellungen des Handys oder Browsers ändern.');
+  const { key } = await api('push/key');
+  const raw = Uint8Array.from(atob(key.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - key.length % 4) % 4)), c => c.charCodeAt(0));
+  const reg = await swReg(); await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription() || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: raw });
+  await api('push/subscribe', 'POST', sub.toJSON());
+}
+async function pushAus() {
+  const sub = await pushAbo(); if (!sub) return;
+  try { await api('push/unsubscribe', 'POST', { endpoint: sub.endpoint }); } catch { /* trotzdem abmelden */ }
+  await sub.unsubscribe();
+}
+async function pushKarte(box) {
+  const aktiv = pushMoeglich() && !!(await pushAbo());
+  box.innerHTML = `<h2>Mitteilungen auf diesem Gerät</h2>
+    <p>${aktiv ? '<span class="badge ok">eingeschaltet</span>' : '<span class="badge plain">aus</span>'}</p>
+    <p class="muted small">Push für neue Mails, Termine und fällige Aufgaben. Inhalt nur Titel und kurzer Text.
+      ${istIOS() && !istApp() ? 'Am iPhone zuerst in Safari "Teilen", "Zum Home-Bildschirm" und das Tool von dort öffnen.' : ''}
+      Klappt nur über HTTPS, also erst auf dem Server.</p>
+    <div class="btn-row">${aktiv ? '<button type="button" class="btn sm" id="pushTest">Test senden</button><button type="button" class="btn sm" id="pushAus">Ausschalten</button>'
+      : '<button type="button" class="btn sm primary" id="pushEin">Einschalten</button>'}</div>`;
+  $('#pushEin', box)?.addEventListener('click', async () => { try { await pushEin(); toast('Mitteilungen eingeschaltet'); pushKarte(box); } catch (e) { alert(e.message); } });
+  $('#pushAus', box)?.addEventListener('click', async () => { await pushAus(); toast('Mitteilungen ausgeschaltet'); pushKarte(box); });
+  $('#pushTest', box)?.addEventListener('click', async () => {
+    try { const r = await api('push/test', 'POST', {}); toast(r.ok ? 'Test gesendet' : 'Nicht zugestellt. Ist das Gerät noch angemeldet?'); } catch (e) { toast(e.message); }
+  });
+}
+
+/* Zahl am App-Symbol: überfällige Aufgaben und neue Mails, jede Minute und beim Zurückkehren in die App */
+async function badgeSync() {
+  try {
+    const { badge } = await api('badge');
+    if ('setAppBadge' in navigator) badge > 0 ? navigator.setAppBadge(badge) : navigator.clearAppBadge();
+    App.badge = badge;
+    if (App.nachBadge) App.nachBadge(badge);
+  } catch { /* offline oder nicht unterstützt */ }
+}
+
+/* Hinweis "Als App installieren" auf dem Handy, höchstens alle 30 Tage */
+let installEvent = null;
+addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installEvent = e; });
+function installHinweis() {
+  const handy = istIOS() || /Android/.test(navigator.userAgent);
+  let spaeter = 0;
+  try { spaeter = Number(localStorage.getItem('studio_install_spaeter') || 0); } catch { /* ohne Speicher */ }
+  if (istApp() || !handy || Date.now() - spaeter < 30 * 864e5 || !App.me) return;
+  const text = installEvent ? 'Studio-Tool als App installieren, dann liegt es mit einem Tipp auf dem Home-Bildschirm.'
+    : istIOS() ? 'Als App: unten auf <b>Teilen</b> tippen, dann <b>Zum Home-Bildschirm</b>.' : 'Als App: oben rechts im Menü <b>App installieren</b> wählen.';
+  document.body.insertAdjacentHTML('beforeend', `<div id="installHint" class="install-hint" role="dialog" aria-label="App installieren">
+    <img src="/static/icon-192.png" alt="" width="44" height="44"><div class="ih-text">${text}</div>
+    <div class="ih-btns">${installEvent ? '<button class="btn primary sm" id="ihJa">Installieren</button>' : ''}<button class="btn sm" id="ihSpaeter">${installEvent ? 'Später' : 'OK'}</button></div></div>`);
+  $('#ihSpaeter').addEventListener('click', () => { try { localStorage.setItem('studio_install_spaeter', String(Date.now())); } catch { /* egal */ } $('#installHint').remove(); });
+  $('#ihJa')?.addEventListener('click', async () => { const ev = installEvent; installEvent = null; $('#installHint').remove(); try { ev.prompt(); await ev.userChoice; } catch { /* abgelehnt */ } });
+}
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+setTimeout(installHinweis, 4000);
+setTimeout(badgeSync, 1500);
+setInterval(badgeSync, 60000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') badgeSync(); });

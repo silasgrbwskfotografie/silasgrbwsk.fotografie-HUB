@@ -202,3 +202,11 @@ a.linkbtn{text-decoration:none}
 #aboCard{margin-top:14px}
 #aboUrl{flex:1;min-width:0}
 @media (max-width:700px){.kal-tag{min-height:64px}.kal-monat .kal-chip{font-size:10px;padding:1px 3px}}
+
+/* Phase 7: App-Hinweis */
+.install-hint{position:fixed;left:12px;right:12px;bottom:calc(76px + env(safe-area-inset-bottom));z-index:90;background:var(--ink);color:#fff;border-radius:12px;
+  padding:14px 16px;box-shadow:0 10px 30px rgba(0,0,0,.35);display:flex;gap:12px;align-items:center}
+.install-hint img{border-radius:10px;flex:none}
+.ih-text{flex:1;font-size:14px;line-height:1.45}
+.ih-btns{display:grid;gap:6px;flex:none}
+.ih-btns .btn:not(.primary){background:transparent;color:#fff;border-color:#555}
