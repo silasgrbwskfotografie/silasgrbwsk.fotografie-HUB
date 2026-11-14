@@ -25,6 +25,7 @@ import calendar
 import contextlib
 import csv
 import io
+import math
 import ipaddress
 import zipfile
 import getpass
@@ -54,7 +55,7 @@ import webpush
 from postfach import PostfachError, imap_quote, pf_head, pf_name
 from webpush import b64u, b64u_dec, ec_pub_point, push_endpoint_ok
 
-VERSION = "0.11"
+VERSION = "0.12"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -299,6 +300,36 @@ TABLES = {
         "sort": "INTEGER DEFAULT 0",
         "aktiv": "INTEGER DEFAULT 1",
     },
+    # ---- Phase 11: Fahrtenbuch ----
+    "fahrzeuge": {
+        "name": "TEXT NOT NULL",
+        "kennzeichen": "TEXT",
+        "km_start": "INTEGER",                           # Kilometerstand bei Beginn des Fahrtenbuchs
+        "aktiv": "INTEGER DEFAULT 1",
+    },
+    "fahrten": {
+        "fahrzeug_id": "INTEGER REFERENCES fahrzeuge(id)",
+        "datum": "TEXT",
+        "beginn": "TEXT",                                # HH:MM
+        "ende": "TEXT",
+        "km_start": "INTEGER",                           # Tachostand, maßgeblich
+        "km_ende": "INTEGER",
+        "start_ort": "TEXT",
+        "ziel_ort": "TEXT",
+        "zweck": "TEXT",
+        "partner": "TEXT",                               # Geschäftspartner
+        "art": "TEXT DEFAULT 'betrieblich'",             # FAHRT_ARTEN
+        "umweg_grund": "TEXT",
+        "kunde_id": "INTEGER REFERENCES kunden(id)",
+        "auftrag_id": "INTEGER REFERENCES auftraege(id)",
+        "quelle": "TEXT DEFAULT 'Hand'",                 # Hand, GPS, Driversnote
+        "strecke_m": "INTEGER",                          # GPS-Strecke oder Strecke aus dem Import, nur zur Kontrolle
+        "luecken": "INTEGER DEFAULT 0",                  # Lücken in der GPS-Aufzeichnung
+        "import_datei": "TEXT",                          # Originaldatei des Imports unter uploads/
+        "notiz": "TEXT",
+        "erfasst_am": "TEXT",                            # Zeitpunkt der Erfassung, nie änderbar
+        "geaendert_am": "TEXT",
+    },
     "push_abos": {                                       # angemeldetes Gerät
         "endpoint": "TEXT",                              # eindeutig über ux_push_endpoint
         "p256dh": "TEXT",
@@ -321,6 +352,7 @@ INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_mail_verweise_mid ON mail_verweise(message_id)",
     "CREATE INDEX IF NOT EXISTS ix_termine_beginn ON termine(beginn)",
     "CREATE INDEX IF NOT EXISTS ix_ausgaben_datum ON ausgaben(datum)",
+    "CREATE INDEX IF NOT EXISTS ix_fahrten_fz ON fahrten(fahrzeug_id, datum, beginn)",
     "CREATE INDEX IF NOT EXISTS ix_aufgaben_faellig ON aufgaben(faellig)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_push_endpoint ON push_abos(endpoint)",
 )
@@ -348,6 +380,8 @@ SEED_AUFGABEN = (("Akkus laden", -1), ("Bilder sichern", 0), ("Auswahl bearbeite
                  ("Link verschicken", 3), ("Zahlung prüfen", 7))
 # Kategorien als Vorlage (Liste aus der Planung), in den Einstellungen änderbar. Welche gelten, klärt Silas mit der Steuerberatung.
 SEED_KATEGORIEN = ("Ausrüstung", "Software und Abos", "Fahrtkosten", "Telefon und Internet", "Fortbildung", "Bürobedarf", "Sonstiges")
+FAHRT_ARTEN = ("betrieblich", "privat", "Wohnung und Arbeitsstätte", "storniert")
+FAHRT_QUELLEN = ("Hand", "GPS", "Driversnote")
 WIEDERHOLUNGEN = ("", "täglich", "wöchentlich", "monatlich", "jährlich")
 PRIORITAETEN = ("Hoch", "Mittel", "Niedrig")
 STATUS_AUFGABE = ("Offen", "In Arbeit", "Erledigt")
@@ -391,6 +425,11 @@ def init_db():
                      "recovery TEXT, enabled_at TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS secrets (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        # Fahrtenbuch: GPS-Punkte und Änderungsverlauf je Fahrt (nur über eigene Schnittstellen erreichbar)
+        conn.execute("CREATE TABLE IF NOT EXISTS fahrt_punkte (id INTEGER PRIMARY KEY AUTOINCREMENT, fahrt_id INTEGER REFERENCES fahrten(id), "
+                     "zeit TEXT, lat REAL, lon REAL, genauigkeit REAL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS fahrt_aenderungen (id INTEGER PRIMARY KEY AUTOINCREMENT, fahrt_id INTEGER, zeitpunkt TEXT, "
+                     "feld TEXT, alt TEXT, neu TEXT, grund TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS monats_sperren (monat TEXT PRIMARY KEY, gesperrt_am TEXT)")   # JJJJ-MM
         conn.execute("CREATE TABLE IF NOT EXISTS erinnerungen (schluessel TEXT PRIMARY KEY, zeit TEXT)")   # schon gesendete Push-Erinnerungen
         conn.execute("CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, user_id INTEGER, "
@@ -765,14 +804,15 @@ def twofa_reset(username):
 # Phase 2: Kunden, Kontakte, Pakete, Aufträge (allgemeine Tabellen-Schnittstelle wie api_table im Hub)
 # ---------------------------------------------------------------------------
 API_TABLES = ("kunden", "kontakte", "pakete", "auftraege", "zahlungen", "lieferlinks", "vorlagen", "vertraege", "dokumente",
-              "termine", "aufgaben", "aufgaben_vorlagen", "mailkonten", "mail_verweise", "ausgaben", "ausgaben_kategorien")
+              "termine", "aufgaben", "aufgaben_vorlagen", "mailkonten", "mail_verweise", "ausgaben", "ausgaben_kategorien", "fahrzeuge", "fahrten")
 ORDER = {"kunden": "name COLLATE NOCASE, id", "kontakte": "name COLLATE NOCASE, id", "pakete": "sort, id",
          "auftraege": "datum, uhrzeit, id", "zahlungen": "auftrag_id, art = 'Zahlung', id",
          "lieferlinks": "auftrag_id, erstellt_am, id", "vorlagen": "sort, id", "vertraege": "beginn, id",
          "dokumente": "hochgeladen_am DESC, id", "termine": "beginn, id",
          "aufgaben": "status = 'Erledigt', faellig = '', faellig IS NULL, faellig, prioritaet = 'Niedrig', prioritaet = 'Mittel', sort, id",
          "aufgaben_vorlagen": "paket_id, sort, id", "mailkonten": "sort, id", "mail_verweise": "erstellt_am DESC, id",
-         "ausgaben": "datum IS NULL DESC, datum DESC, id DESC", "ausgaben_kategorien": "sort, id"}
+         "ausgaben": "datum IS NULL DESC, datum DESC, id DESC", "ausgaben_kategorien": "sort, id",
+         "fahrzeuge": "aktiv DESC, name, id", "fahrten": "datum DESC, beginn DESC, id DESC"}
 # Diese Felder setzt nur der Server (Preise, Fristen, Zeitstempel)
 SERVER_FIELDS = {
     "kunden": ("erstellt_am", "geaendert_am"),
@@ -785,6 +825,7 @@ SERVER_FIELDS = {
     "termine": ("erstellt_am", "geaendert_am"),
     "mail_verweise": ("erstellt_am",),
     "ausgaben": ("erstellt_am", "geaendert_am", "datei", "datei_name"),
+    "fahrten": ("erfasst_am", "geaendert_am", "strecke_m", "luecken", "import_datei"),
     "auftraege": ("erstellt_am", "geaendert_am", "serie", "grundpreis_cent", "inkl_spieler", "zusatz_je_spieler_cent",
                   "anfahrt_frei_km", "anfahrt_cent_je_km", "zusatzspieler_cent", "anfahrt_cent", "lieferfrist"),
 }
@@ -927,6 +968,24 @@ def check_row(conn, table, row):
             raise BadRequest("Steuersatz bitte in Prozent (0 bis 100).")
         if row.get("zahlart") and row["zahlart"] not in ZAHLARTEN + ("Karte", "Lastschrift"):
             raise BadRequest("Unbekannte Zahlart.")
+    if table == "fahrzeuge" and not row.get("name"):
+        raise BadRequest("Bitte einen Namen für das Fahrzeug eingeben.")
+    if table == "fahrten":
+        if not row.get("fahrzeug_id"):
+            raise BadRequest("Bitte ein Fahrzeug wählen.")
+        try:
+            date.fromisoformat(row.get("datum") or "")
+        except ValueError:
+            raise BadRequest("Bitte ein gültiges Datum eingeben.")
+        for k in ("beginn", "ende"):
+            if row.get(k) and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", row[k]):
+                raise BadRequest("Uhrzeit bitte als HH:MM.")
+        if row.get("km_start") is not None and row.get("km_ende") is not None and row["km_ende"] < row["km_start"]:
+            raise BadRequest("Der Kilometerstand am Ende ist kleiner als am Beginn.")
+        if (row.get("art") or "betrieblich") not in FAHRT_ARTEN:
+            raise BadRequest("Unbekannte Art der Fahrt.")
+        if (row.get("quelle") or "Hand") not in FAHRT_QUELLEN:
+            raise BadRequest("Unbekannte Quelle.")
     if table == "ausgaben_kategorien" and not row.get("name"):
         raise BadRequest("Bitte einen Namen eingeben.")
     if table == "mail_verweise" and (not row.get("konto_id") or not row.get("message_id")):
@@ -1559,7 +1618,7 @@ def sperre_betroffen(table, r):
     """Datum, das für die Sperre zählt: Ausgaben nach Belegdatum, Einnahmen nach Zahldatum (nur bezahlte)."""
     if not r:
         return None
-    if table == "ausgaben":
+    if table in ("ausgaben", "fahrten"):
         return r.get("datum") if isinstance(r, dict) else r["datum"]
     if table == "zahlungen":
         d = r if isinstance(r, dict) else row_dict(r)
@@ -1569,7 +1628,7 @@ def sperre_betroffen(table, r):
 
 def sperre_pruefen(conn, table, old, row, data):
     """Änderungen in gesperrten Monaten nur mit Grund. Rückgabe: der Grund (für das Protokoll) oder ""."""
-    if table not in ("ausgaben", "zahlungen"):
+    if table not in ("ausgaben", "zahlungen", "fahrten"):
         return ""
     betroffen = [d for d in (sperre_betroffen(table, old), sperre_betroffen(table, row)) if d and monat_gesperrt(conn, d)]
     if not betroffen:
@@ -1660,6 +1719,169 @@ def export_belege_zip(conn, von, bis):
     return buf.getvalue()
 
 
+# ---------------------------------------------------------------------------
+# Phase 11: Fahrtenbuch. Maßgeblich ist der Kilometerstand vom Tacho; GPS und Import sind Vorschlag und Kontrolle.
+# Ob das Finanzamt das Fahrtenbuch anerkennt, entscheidet am Ende das Finanzamt.
+# ---------------------------------------------------------------------------
+GPS_MAX_UNGENAU_M = 50      # schlechtere Punkte werden verworfen
+GPS_LUECKE_S = 60           # mehr als 60 Sekunden ohne Punkt: Lücke (Bildschirm aus, andere App vorne)
+
+
+def entfernung_m(a, b):
+    """Luftlinie zwischen zwei Punkten (lat, lon) in Metern (Haversine, Erdradius 6371 km)."""
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 2 * 6371000 * math.asin(math.sqrt(h))
+
+
+def gps_strecke(punkte):
+    """punkte: [(zeit ISO, lat, lon)] zeitlich sortiert. Rückgabe: (Meter, Lücken [{von, bis, sekunden}])."""
+    meter, luecken = 0.0, []
+    for p0, p1 in zip(punkte, punkte[1:]):
+        meter += entfernung_m(p0[1:3], p1[1:3])
+        sek = (datetime.fromisoformat(p1[0]) - datetime.fromisoformat(p0[0])).total_seconds()
+        if sek > GPS_LUECKE_S:
+            luecken.append({"von": p0[0], "bis": p1[0], "sekunden": int(sek)})
+    return int(round(meter)), luecken
+
+
+def km_pruefung(conn, fahrzeug_id):
+    """Lückenlose Kilometerfolge: Beginn jeder Fahrt = Ende der vorherigen (erste: Anfangsstand des Fahrzeugs)."""
+    fz = conn.execute("SELECT km_start FROM fahrzeuge WHERE id=?", (fahrzeug_id,)).fetchone()
+    vorher = fz["km_start"] if fz else None
+    out = []
+    for f in conn.execute("SELECT id, datum, beginn, km_start, km_ende FROM fahrten WHERE fahrzeug_id=? AND art != 'storniert' "
+                          "ORDER BY datum, IFNULL(beginn, ''), id", (fahrzeug_id,)):
+        if f["km_start"] is not None and vorher is not None and f["km_start"] != vorher:
+            out.append({"fahrt_id": f["id"], "datum": f["datum"], "erwartet": vorher, "ist": f["km_start"],
+                        "art": "Lücke" if f["km_start"] > vorher else "Überschneidung"})
+        if f["km_ende"] is not None:
+            vorher = f["km_ende"]
+    return out
+
+
+def fahrten_auswertung(conn, jahr, fahrzeug_id):
+    km = {a: 0 for a in FAHRT_ARTEN if a != "storniert"}
+    offen = 0
+    for f in conn.execute("SELECT art, km_start, km_ende FROM fahrten WHERE fahrzeug_id=? AND substr(datum, 1, 4)=? AND art != 'storniert'",
+                          (fahrzeug_id, str(jahr))):
+        if f["km_start"] is None or f["km_ende"] is None:
+            offen += 1
+            continue
+        km[f["art"]] = km.get(f["art"], 0) + f["km_ende"] - f["km_start"]
+    gesamt = sum(km.values())
+    return {"jahr": int(jahr), "km": km, "gesamt": gesamt, "unvollstaendig": offen,
+            "anteil": {a: (round(v * 1000 / gesamt) / 10 if gesamt else 0) for a, v in km.items()}}
+
+
+def fahrt_vorschlaege(conn, tag):
+    """Aufträge mit Ort und Kilometern der letzten 60 Tage, zu denen es noch keine Fahrt gibt."""
+    seit = (date.fromisoformat(tag) - timedelta(days=60)).isoformat()
+    return [row_dict(r) for r in conn.execute(
+        "SELECT a.id AS auftrag_id, a.datum, a.uhrzeit, a.ort, a.km, a.begegnung, a.kunde_id, k.name AS kunde FROM auftraege a "
+        "LEFT JOIN kunden k ON k.id = a.kunde_id WHERE a.datum >= ? AND a.datum <= ? AND IFNULL(a.km, 0) > 0 AND a.status != 'Abgesagt' "
+        "AND IFNULL(a.archiviert, 0)=0 AND NOT EXISTS (SELECT 1 FROM fahrten f WHERE f.auftrag_id = a.id) ORDER BY a.datum DESC", (seit, tag))]
+
+
+def export_fahrten(conn, von, bis):
+    fz = {r["id"]: f"{r['name']} {r['kennzeichen'] or ''}".strip() for r in conn.execute("SELECT * FROM fahrzeuge")}
+    anz = {r[0]: r[1] for r in conn.execute("SELECT fahrt_id, COUNT(*) FROM fahrt_aenderungen GROUP BY fahrt_id")}
+    rows = conn.execute("SELECT * FROM fahrten WHERE datum >= ? AND datum <= ? ORDER BY fahrzeug_id, datum, IFNULL(beginn, ''), id", (von, bis))
+    return csv_text(["Fahrzeug", "Datum", "Beginn", "Ende", "km Beginn", "km Ende", "km", "Start", "Ziel", "Zweck", "Geschäftspartner", "Art",
+                     "Umweg-Begründung", "Quelle", "GPS-Strecke km", "Erfasst am", "Änderungen"],
+                    [(fz.get(r["fahrzeug_id"], ""), datum_text(r["datum"]), r["beginn"], r["ende"], r["km_start"], r["km_ende"],
+                      (r["km_ende"] - r["km_start"]) if r["km_start"] is not None and r["km_ende"] is not None else "",
+                      r["start_ort"], r["ziel_ort"], r["zweck"], r["partner"], r["art"], r["umweg_grund"], r["quelle"],
+                      f"{r['strecke_m'] / 1000:.1f}".replace(".", ",") if r["strecke_m"] else "", r["erfasst_am"], anz.get(r["id"], 0)) for r in rows])
+
+
+# Import (zum Beispiel Driversnote): CSV hochladen, Spalten zuordnen, Dubletten erkennen.
+# shortcut: nur CSV, kein Excel. Das genaue Format wird mit einer echten Export-Datei festgelegt; bei Excel als CSV speichern.
+IMPORT_FELDER = ("datum", "beginn", "ende", "km_start", "km_ende", "strecke_km", "start_ort", "ziel_ort", "zweck", "partner", "art")
+DATUMSFORMATE = {"TT.MM.JJJJ": "%d.%m.%Y", "JJJJ-MM-TT": "%Y-%m-%d", "TT/MM/JJJJ": "%d/%m/%Y", "MM/TT/JJJJ": "%m/%d/%Y"}
+
+
+def import_csv_lesen(raw):
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    try:
+        dialekt = csv.Sniffer().sniff(text[:5000], delimiters=";,\t")
+    except csv.Error:
+        dialekt = csv.excel
+    zeilen = [z for z in csv.reader(io.StringIO(text), dialekt) if any(x.strip() for x in z)]
+    if len(zeilen) < 2:
+        raise BadRequest("Die Datei enthält keine Fahrten (erwartet: Kopfzeile und mindestens eine Zeile).")
+    return zeilen[0], zeilen[1:]
+
+
+def zahl(v):
+    v = str(v or "").strip().replace(" ", "")
+    if not v:
+        return None
+    if "," in v and "." in v:   # 12.345,6 oder 12,345.6
+        v = v.replace(".", "").replace(",", ".") if v.rfind(",") > v.rfind(".") else v.replace(",", "")
+    else:
+        v = v.replace(",", ".")
+    return float(v)
+
+
+def import_zeile(z, zuordnung, fmt):
+    def feld(k):
+        i = zuordnung.get(k)
+        return z[i].strip() if isinstance(i, int) and 0 <= i < len(z) else ""
+    d = datetime.strptime(feld("datum")[:10], DATUMSFORMATE[fmt]).date().isoformat()
+    out = {"datum": d}
+    for k in ("beginn", "ende"):
+        m = re.search(r"(\d{1,2}):(\d{2})", feld(k))
+        out[k] = f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
+    for k in ("km_start", "km_ende"):
+        v = zahl(feld(k))
+        out[k] = int(round(v)) if v is not None else None
+    s_ = zahl(feld("strecke_km"))
+    out["strecke_m"] = int(round(s_ * 1000)) if s_ is not None else None
+    for k in ("start_ort", "ziel_ort", "zweck", "partner"):
+        out[k] = feld(k)[:300]
+    a = feld("art").lower()
+    out["art"] = "privat" if a.startswith(("priv", "personal")) else "Wohnung und Arbeitsstätte" if ("arbeit" in a or "commut" in a) else "betrieblich"
+    return out
+
+
+def import_fahrten(conn, fahrzeug_id, raw, name, zuordnung, fmt, user):
+    if fmt not in DATUMSFORMATE:
+        raise BadRequest("Unbekanntes Datumsformat.")
+    if not isinstance(zuordnung, dict) or not isinstance(zuordnung.get("datum"), int):
+        raise BadRequest("Bitte mindestens die Spalte für das Datum zuordnen.")
+    if not conn.execute("SELECT 1 FROM fahrzeuge WHERE id=?", (fahrzeug_id,)).fetchone():
+        raise BadRequest("Bitte ein Fahrzeug wählen.")
+    kopf, zeilen = import_csv_lesen(raw)
+    fname = secrets.token_hex(16) + ".csv"   # Original aufbewahren
+    (UPLOADS / fname).write_bytes(raw)
+    angelegt, dubletten, fehler = 0, 0, []
+    for nr, z in enumerate(zeilen, 2):
+        try:
+            f = import_zeile(z, zuordnung, fmt)
+        except (ValueError, KeyError) as e:
+            fehler.append(f"Zeile {nr}: {e}")
+            continue
+        if conn.execute("SELECT 1 FROM fahrten WHERE fahrzeug_id=? AND datum=? AND IFNULL(beginn, '')=? AND "
+                        "(IFNULL(km_start, -1)=IFNULL(?, -1) AND IFNULL(ziel_ort, '')=?) AND art != 'storniert'",
+                        (fahrzeug_id, f["datum"], f["beginn"], f["km_start"], f["ziel_ort"])).fetchone():
+            dubletten += 1
+            continue
+        try:
+            speichern(conn, "fahrten", {**f, "fahrzeug_id": fahrzeug_id, "quelle": "Driversnote"}, None, user,
+                      fest={"import_datei": f"{fname}|{name[:100]}", "strecke_m": f["strecke_m"]})
+            angelegt += 1
+        except BadRequest as e:
+            fehler.append(f"Zeile {nr}: {e}")
+    audit(conn, user, "Fahrten importiert", "fahrten", None, name[:100], {"angelegt": angelegt, "Dubletten": dubletten, "Fehler": len(fehler)})
+    return {"angelegt": angelegt, "dubletten": dubletten, "fehler": fehler[:50], "spalten": kopf}
+
+
 def audit_label(table, r):
     if table == "auftraege":
         return f"{datum_text(r['datum'])} {r['begegnung'] or ''}".strip()
@@ -1671,6 +1893,8 @@ def audit_label(table, r):
         return r["adresse"] or ""
     if table == "mail_verweise":
         return r["betreff"] or r["message_id"] or ""
+    if table == "fahrten":
+        return f"Fahrt {datum_text(r['datum'])} {r['ziel_ort'] or ''}".strip()
     if table == "ausgaben":
         return f"{datum_text(r['datum'])} {r['lieferant'] or ''} {eur_text(r['betrag_cent']) if r['betrag_cent'] is not None else ''}".strip()
     if table == "vertraege":
@@ -1700,6 +1924,11 @@ def speichern(conn, table, data, old, user, fest=None):
     row = {**(row_dict(old) if old else {}), **vals}
     check_row(conn, table, row)
     grund = sperre_pruefen(conn, table, old, row, data)
+    if table == "fahrten":
+        if not old:
+            vals["erfasst_am"] = now   # Zeitpunkt der Erfassung, steht fest
+        if row.get("art") == "storniert" and (not old or old["art"] != "storniert") and not (grund or str(data.get("grund") or "").strip()):
+            raise BadRequest("Eine Fahrt wird nicht gelöscht, sondern storniert. Bitte einen Grund angeben, er steht im Änderungsverlauf.")
     if table == "auftraege":
         pr = auftrag_preise(conn, row, old)
         pr.pop("berechnet_cent")
@@ -1745,6 +1974,13 @@ def speichern(conn, table, data, old, user, fest=None):
     r = conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone()
     if changes and grund:
         changes["Grund (gesperrter Monat)"] = grund
+    if table == "fahrten" and old:   # jede Änderung mit altem und neuem Wert, bleibt sichtbar
+        g = grund or str(data.get("grund") or "").strip()[:300]
+        for k, v in changes.items():
+            if k in TABLES["fahrten"] and isinstance(v, list):
+                alt, neu = v
+                conn.execute("INSERT INTO fahrt_aenderungen (fahrt_id, zeitpunkt, feld, alt, neu, grund) VALUES (?, ?, ?, ?, ?, ?)",
+                             (rid, now, k, "" if alt is None else str(alt), "" if neu is None else str(neu), g))
     if changes:
         audit(conn, user, "geändert" if old else "neu", table, rid, audit_label(table, r), changes)
     out = row_dict(r)
@@ -2187,7 +2423,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("X-Robots-Tag", "noindex, nofollow")
         # Nur eigene Skripte, Stile und Bilder. Keine Inline-Skripte, keine fremden Quellen.
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; "
+                                                    "img-src 'self' data: https://tile.openstreetmap.org; "
                                                     "connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; "
                                                     "frame-ancestors 'none'")
         super().end_headers()
@@ -2548,7 +2785,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(euer(conn, int(jahr) if re.fullmatch(r"20[0-9]{2}", jahr) else int(heute()[:4])))
         if head == "sperren":
             return self.api_sperren(method, p[1:], user)
-        if method == "GET" and head == "export" and len(p) == 2 and p[1] in ("einnahmen.csv", "ausgaben.csv", "belege.zip"):
+        if head == "fahrtenbuch":
+            return self.api_fahrtenbuch(method, p[1:], user)
+        if method == "GET" and head == "export" and len(p) == 2 and p[1] in ("einnahmen.csv", "ausgaben.csv", "belege.zip", "fahrten.csv"):
             q = parse_qs(urlparse(self.path).query)
             von, bis = (q.get("von") or [""])[0], (q.get("bis") or [""])[0]
             try:
@@ -2560,7 +2799,7 @@ class Handler(BaseHTTPRequestHandler):
                 if p[1] == "belege.zip":
                     body, ctype = export_belege_zip(conn, von, bis), "application/zip"
                 else:
-                    body = (export_einnahmen if p[1] == "einnahmen.csv" else export_ausgaben)(conn, von, bis).encode("utf-8")
+                    body = {"einnahmen.csv": export_einnahmen, "ausgaben.csv": export_ausgaben, "fahrten.csv": export_fahrten}[p[1]](conn, von, bis).encode("utf-8")
                     ctype = "text/csv; charset=utf-8"
                 audit(conn, user, "Export", "", None, p[1], {"von": von, "bis": bis})
             name = f"{p[1].split('.')[0]}_{von}_bis_{bis}.{p[1].split('.')[1]}"
@@ -2653,6 +2892,12 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE termine SET kunde_id=NULL WHERE kunde_id=?", (rid,))
                 if table == "pakete":
                     conn.execute("DELETE FROM aufgaben_vorlagen WHERE paket_id=?", (rid,))
+                if table == "fahrten":   # Fahrten werden storniert, nicht gelöscht; nur eine leere, nicht beendete GPS-Aufzeichnung darf weg
+                    if not (old["quelle"] == "GPS" and old["km_ende"] is None):
+                        raise BadRequest("Fahrten lassen sich nicht löschen. Bitte als storniert markieren, mit Grund.")
+                    conn.execute("DELETE FROM fahrt_punkte WHERE fahrt_id=?", (rid,))
+                if table == "fahrzeuge" and conn.execute("SELECT 1 FROM fahrten WHERE fahrzeug_id=?", (rid,)).fetchone():
+                    raise BadRequest("Zu diesem Fahrzeug gibt es Fahrten. Bitte auf inaktiv stellen statt löschen.")
                 if table == "mailkonten":   # Zugangsdaten, Abrufstand und Verweise des Kontos gehen mit
                     conn.execute("DELETE FROM secrets WHERE key=? OR key LIKE ?", (f"mailkonto:{rid}", f"pf:{rid}:%"))
                     conn.execute("DELETE FROM mail_eingang WHERE konto_id=?", (rid,))
@@ -2682,6 +2927,69 @@ class Handler(BaseHTTPRequestHandler):
                        **({"Grund (gesperrter Monat)": grund} if grund else {})})
                 return self.send_json({"ok": True})
         return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+
+    # -- Fahrtenbuch (/api/fahrtenbuch/...) --------------------------------
+    def api_fahrtenbuch(self, method, p, user):
+        sub = p[0] if p else ""
+        q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+        with db() as conn:
+            if method == "GET" and sub == "pruefung":
+                return self.send_json({str(r["id"]): km_pruefung(conn, r["id"]) for r in conn.execute("SELECT id FROM fahrzeuge")})
+            if method == "GET" and sub == "auswertung":
+                jahr = q.get("jahr") or ""
+                fz = q.get("fahrzeug") or ""
+                if not re.fullmatch(r"20[0-9]{2}", jahr) or not fz.isdigit():
+                    raise BadRequest("Bitte Jahr und Fahrzeug angeben.")
+                return self.send_json(fahrten_auswertung(conn, int(jahr), int(fz)))
+            if method == "GET" and sub == "vorschlaege":
+                return self.send_json(fahrt_vorschlaege(conn, heute()))
+            if method == "POST" and sub == "import":
+                data = self.read_json(limit=DATEI_MAX * 4 // 3 + 4096)
+                m = re.match(r"^data:[\w/+.-]*;base64,(.*)$", str(data.get("data") or ""), re.S)
+                if not m:
+                    raise BadRequest("Ungültige Datei.")
+                raw = base64.b64decode(m.group(1))
+                if len(raw) > DATEI_MAX:
+                    raise BadRequest("Die Datei ist zu groß.")
+                if data.get("nur_vorschau"):
+                    kopf, zeilen = import_csv_lesen(raw)
+                    return self.send_json({"spalten": kopf, "zeilen": zeilen[:5], "anzahl": len(zeilen)})
+                fz = data.get("fahrzeug_id")
+                return self.send_json(import_fahrten(conn, int(fz) if str(fz or "").isdigit() else 0, raw, str(data.get("name") or "import.csv"),
+                                                     data.get("zuordnung"), str(data.get("datumsformat") or ""), user))
+            if len(p) == 3 and sub == "fahrt" and p[1].isdigit() and p[2] in ("punkte", "aenderungen"):
+                fid = int(p[1])
+                f = conn.execute("SELECT * FROM fahrten WHERE id=?", (fid,)).fetchone()
+                if not f:
+                    return self.send_json({"error": "Diese Fahrt gibt es nicht."}, 404)
+                if p[2] == "aenderungen" and method == "GET":
+                    return self.send_json([row_dict(r) for r in conn.execute("SELECT * FROM fahrt_aenderungen WHERE fahrt_id=? ORDER BY id", (fid,))])
+                if p[2] == "punkte" and method == "POST":   # Punkte einer laufenden GPS-Aufzeichnung, in Paketen
+                    if f["quelle"] != "GPS":
+                        raise BadRequest("Zu dieser Fahrt lassen sich keine GPS-Punkte mehr speichern.")
+                    pts = self.read_json(limit=4 * 1024 * 1024).get("punkte")
+                    if not isinstance(pts, list) or len(pts) > 5000:
+                        raise BadRequest("Ungültige Punkte.")
+                    neu = 0
+                    for x in pts:
+                        try:
+                            t = datetime.fromisoformat(str(x["t"]).replace("Z", "+00:00")).astimezone(TZ).replace(tzinfo=None).isoformat(timespec="seconds")
+                            lat, lon, acc = float(x["lat"]), float(x["lon"]), float(x.get("acc") or 9999)
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        if not (-90 <= lat <= 90 and -180 <= lon <= 180) or acc > GPS_MAX_UNGENAU_M:
+                            continue   # ungenaue Punkte verwerfen
+                        conn.execute("INSERT INTO fahrt_punkte (fahrt_id, zeit, lat, lon, genauigkeit) VALUES (?, ?, ?, ?, ?)", (fid, t, lat, lon, acc))
+                        neu += 1
+                    alle = [(r["zeit"], r["lat"], r["lon"]) for r in conn.execute("SELECT zeit, lat, lon FROM fahrt_punkte WHERE fahrt_id=? ORDER BY zeit, id", (fid,))]
+                    meter, luecken = gps_strecke(alle)
+                    conn.execute("UPDATE fahrten SET strecke_m=?, luecken=? WHERE id=?", (meter, len(luecken), fid))
+                    return self.send_json({"gespeichert": neu, "strecke_m": meter, "luecken": len(luecken)})
+                if p[2] == "punkte" and method == "GET":
+                    alle = [(r["zeit"], r["lat"], r["lon"]) for r in conn.execute("SELECT zeit, lat, lon FROM fahrt_punkte WHERE fahrt_id=? ORDER BY zeit, id", (fid,))]
+                    meter, luecken = gps_strecke(alle)
+                    return self.send_json({"punkte": [[x[1], x[2], x[0]] for x in alle], "strecke_m": meter, "luecken": luecken})
+        return self.send_json({"error": "Unbekannte Schnittstelle"}, 404)
 
     # -- Monatssperre (/api/sperren[/JJJJ-MM]) -----------------------------
     def api_sperren(self, method, p, user):

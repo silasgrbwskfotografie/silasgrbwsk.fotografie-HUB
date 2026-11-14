@@ -1353,7 +1353,7 @@ App.pages.ausgaben = async (view) => {
       <div class="card" id="eListe"><h2>Ausgaben ${jahr} (${imJahr.length})</h2>${imJahr.length ? `<table class="tbl"><tbody>${imJahr.map(zeile).join('')}</tbody></table>` : '<p class="muted">Noch keine Ausgaben in diesem Jahr.</p>'}</div>
       <div class="card"><h2>Export</h2>
         <div class="toolbar"><label class="check">von <input class="input sm" type="date" id="exVon" value="${von}"></label><label class="check">bis <input class="input sm" type="date" id="exBis" value="${bis}"></label></div>
-        <div class="btn-row"><a class="btn sm" data-export="einnahmen.csv">Einnahmen (CSV)</a><a class="btn sm" data-export="ausgaben.csv">Ausgaben (CSV)</a><a class="btn sm" data-export="belege.zip">Belege (ZIP)</a></div>
+        <div class="btn-row"><a class="btn sm" data-export="einnahmen.csv">Einnahmen (CSV)</a><a class="btn sm" data-export="ausgaben.csv">Ausgaben (CSV)</a><a class="btn sm" data-export="belege.zip">Belege (ZIP)</a><a class="btn sm" data-export="fahrten.csv">Fahrten (CSV)</a></div>
         <p class="muted small">CSV mit Semikolon für Excel, Beträge mit Komma. Belege im ZIP heißen Datum_Lieferant_Betrag. Fahrten kommen aus dem Fahrtenbuch. DATEV nur, wenn die Steuerberatung es verlangt.</p></div>
       <div class="card" id="eKat"><h2>Kategorien</h2><ul class="kontakte">${kategorien.map(k => `<li><button type="button" class="linkbtn" data-kat="${k.id}">${esc(k.name)}</button>${k.aktiv ? '' : ' <span class="badge plain">aus</span>'}</li>`).join('')}</ul>
         <button type="button" class="btn sm" id="katNeu">Kategorie hinzufügen</button><p class="muted small">Welche Kategorien gelten, mit der Steuerberatung abstimmen.</p></div>
@@ -1376,6 +1376,285 @@ App.pages.ausgaben = async (view) => {
     if (b.entsperren) {
       const grund = prompt('Grund für das Entsperren (steht im Protokoll):');
       if (grund) { try { await api(`sperren/${b.entsperren}?grund=${encodeURIComponent(grund)}`, 'DELETE'); toast('Entsperrt'); router(); } catch (e) { toast(e.message); } }
+    }
+  });
+};
+
+/* ---------- Fahrtenbuch: Tacho maßgeblich, GPS und Import als Vorschlag und Kontrolle ---------- */
+const FAHRT_ARTEN = ['betrieblich', 'privat', 'Wohnung und Arbeitsstätte', 'storniert'];
+const ART_BADGE = { betrieblich: 'ok', privat: 'plain', 'Wohnung und Arbeitsstätte': 'warn', storniert: 'bad' };
+const kmText = f => f.km_start != null && f.km_ende != null ? (f.km_ende - f.km_start).toLocaleString('de-DE') + ' km' : '<span class="badge warn">km fehlen</span>';
+
+function fahrtDialog(f, d, opts = {}) {
+  const felder = [
+    { key: 'fahrzeug_id', label: 'Fahrzeug', type: 'select', required: true, options: d.fahrzeuge.filter(x => x.aktiv || x.id === f.fahrzeug_id).map(x => [x.id, `${x.name} ${x.kennzeichen || ''}`]) },
+    { key: 'datum', label: 'Datum', type: 'date', required: true },
+    { key: 'beginn', label: 'Uhrzeit Beginn', type: 'time' },
+    { key: 'ende', label: 'Uhrzeit Ende', type: 'time' },
+    { key: 'km_start', label: 'Kilometerstand Beginn (Tacho)', type: 'number' },
+    { key: 'km_ende', label: 'Kilometerstand Ende (Tacho)', type: 'number' },
+    { key: 'start_ort', label: 'Start (Adresse)' },
+    { key: 'ziel_ort', label: 'Ziel (Adresse)' },
+    { key: 'zweck', label: 'Zweck', full: true },
+    { key: 'partner', label: 'Geschäftspartner' },
+    { key: 'art', label: 'Art', type: 'select', options: FAHRT_ARTEN.filter(x => x !== 'storniert' || f.id).map(x => [x, x]), def: 'betrieblich' },
+    { key: 'umweg_grund', label: 'Begründung bei Umweg', full: true },
+    { key: 'kunde_id', label: 'Kunde', type: 'select', options: [['', 'ohne']].concat(d.kunden.filter(k => !k.archiviert || k.id === f.kunde_id).map(k => [k.id, k.name])) },
+    { key: 'auftrag_id', label: 'Auftrag', type: 'select', options: [['', 'ohne']].concat(d.auftraege.filter(x => !x.archiviert || x.id === f.auftrag_id).slice(-200).map(x => [x.id, `${datum(x.datum)} ${x.begegnung || ''}`])) },
+    { key: 'notiz', label: 'Notiz', type: 'textarea', full: true },
+    ...(f.id ? [{ key: 'grund', label: 'Grund der Änderung (steht im Änderungsverlauf)', full: true }] : []),
+  ];
+  editRecord('fahrten', opts.titel || (f.id ? 'Fahrt bearbeiten' : 'Fahrt erfassen'), felder, f, {
+    ohneLoeschen: !(f.quelle === 'GPS' && f.km_ende == null),
+    extra: (opts.hinweis ? `<p class="warnline small">${esc(opts.hinweis)}</p>` : '')
+      + (f.id ? `<p class="muted small">Erfasst am ${datum(f.erfasst_am)}, ${esc((f.erfasst_am || '').slice(11, 16))} Uhr. Quelle: ${esc(f.quelle)}.
+        Fahrten werden nicht gelöscht: Art "storniert" mit Grund wählen. Jede Änderung bleibt im Verlauf sichtbar.</p>` : ''),
+    danach: opts.danach,
+  });
+}
+
+/* Karte: OpenStreetMap-Kacheln, die Strecke als Linie darüber (eigene kleine Umsetzung, keine Bibliothek).
+   Die Kartenbilder kommen von tile.openstreetmap.org: deren Server sehen IP und angezeigte Gegend. */
+async function karteDialog(fid) {
+  const g = await api(`fahrtenbuch/fahrt/${fid}/punkte`);
+  const dlg = $('#modal');
+  dlg.innerHTML = `<div class="modal-box"><h2>GPS-Strecke</h2><div id="karte" class="karte"></div>
+    <p class="muted small">${(g.strecke_m / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1 })} km aus ${g.punkte.length} Punkten.
+      ${g.luecken.length ? `<b>${g.luecken.length} Lücke${g.luecken.length === 1 ? '' : 'n'}</b> in der Aufzeichnung (gestrichelt), zum Beispiel Bildschirm aus oder andere App vorne: ` +
+        g.luecken.map(l => `${l.von.slice(11, 16)} bis ${l.bis.slice(11, 16)} Uhr`).join(', ') + '.' : 'Ohne Lücken.'}
+      Maßgeblich bleibt der Tacho.</p>
+    <div class="modal-foot"><span></span><button type="button" class="btn" id="kZu">Schließen</button></div></div>`;
+  $('#kZu').addEventListener('click', () => dlg.close());
+  dlg.showModal();
+  const box = $('#karte');
+  if (g.punkte.length < 2) { box.innerHTML = '<p class="muted">Zu wenige Punkte für eine Karte.</p>'; return; }
+  const W = box.clientWidth || 600, H = box.clientHeight || 360;
+  const welt = (lat, lon, z) => { const n = 256 * 2 ** z, r = lat * Math.PI / 180;
+    return [(lon + 180) / 360 * n, (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * n]; };
+  const lats = g.punkte.map(p => p[0]), lons = g.punkte.map(p => p[1]);
+  let z = 17;
+  for (; z > 3; z--) {
+    const [x1, y1] = welt(Math.max(...lats), Math.min(...lons), z), [x2, y2] = welt(Math.min(...lats), Math.max(...lons), z);
+    if (x2 - x1 < W - 40 && y2 - y1 < H - 40) break;
+  }
+  const [ax, ay] = welt(Math.max(...lats), Math.min(...lons), z), [bx, by] = welt(Math.min(...lats), Math.max(...lons), z);
+  const ox = (ax + bx) / 2 - W / 2, oy = (ay + by) / 2 - H / 2;
+  const max = 2 ** z;
+  for (let tx = Math.floor(ox / 256); tx <= Math.floor((ox + W) / 256); tx++) {
+    for (let ty = Math.floor(oy / 256); ty <= Math.floor((oy + H) / 256); ty++) {
+      if (ty < 0 || ty >= max) continue;
+      const img = document.createElement('img');
+      img.src = `https://tile.openstreetmap.org/${z}/${((tx % max) + max) % max}/${ty}.png`;
+      img.alt = ''; img.referrerPolicy = 'origin'; img.className = 'kachel'; img.width = 256; img.height = 256;
+      img.style.left = (tx * 256 - ox) + 'px'; img.style.top = (ty * 256 - oy) + 'px';
+      box.appendChild(img);
+    }
+  }
+  const xy = g.punkte.map(p => { const [x, y] = welt(p[0], p[1], z); return [x - ox, y - oy, p[2]]; });
+  let linien = '';
+  for (let i = 1; i < xy.length; i++) {
+    const luecke = (new Date(xy[i][2]) - new Date(xy[i - 1][2])) / 1000 > 60;
+    linien += `<line x1="${xy[i - 1][0].toFixed(1)}" y1="${xy[i - 1][1].toFixed(1)}" x2="${xy[i][0].toFixed(1)}" y2="${xy[i][1].toFixed(1)}" class="${luecke ? 'luecke' : 'spur'}"/>`;
+  }
+  box.insertAdjacentHTML('beforeend', `<svg class="strecke" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-label="Gefahrene Strecke">${linien}
+    <circle cx="${xy[0][0]}" cy="${xy[0][1]}" r="6" class="start"/><circle cx="${xy[xy.length - 1][0]}" cy="${xy[xy.length - 1][1]}" r="6" class="ziel"/></svg>
+    <div class="osm-hinweis">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap-Mitwirkende</a></div>`);
+}
+
+async function verlaufDialog(fid) {
+  const v = await api(`fahrtenbuch/fahrt/${fid}/aenderungen`);
+  const dlg = $('#modal');
+  dlg.innerHTML = `<div class="modal-box"><h2>Änderungsverlauf</h2>${v.length ? `<table class="tbl"><thead><tr><th>Zeitpunkt</th><th>Feld</th><th>Alt</th><th>Neu</th><th>Grund</th></tr></thead><tbody>
+    ${v.map(x => `<tr><td class="nowrap">${datum(x.zeitpunkt)} ${esc(x.zeitpunkt.slice(11, 16))}</td><td>${esc(x.feld)}</td><td>${esc(x.alt)}</td><td>${esc(x.neu)}</td><td>${esc(x.grund)}</td></tr>`).join('')}
+    </tbody></table>` : '<p class="muted">Seit der Erfassung nicht geändert.</p>'}<div class="modal-foot"><span></span><button type="button" class="btn" id="vZu">Schließen</button></div></div>`;
+  $('#vZu').addEventListener('click', () => dlg.close());
+  dlg.showModal();
+}
+
+/* GPS-Aufzeichnung: nur solange die Seite vorne und der Bildschirm an ist (Grenze von Web-Apps am iPhone) */
+App.gps = null;
+async function gpsSenden() {
+  const g = App.gps;
+  if (!g || !g.puffer.length) return;
+  const teil = g.puffer.splice(0);
+  try { const r = await api(`fahrtenbuch/fahrt/${g.fahrt.id}/punkte`, 'POST', { punkte: teil }); g.meter = r.strecke_m; g.luecken = r.luecken; }
+  catch { g.puffer.unshift(...teil); }   // ohne Netz: später noch einmal
+  gpsAnzeige();
+}
+function gpsAnzeige() {
+  const p = $('#gpsPanel');
+  const g = App.gps;
+  if (!p) return;
+  if (!g) { p.innerHTML = ''; p.classList.add('hidden'); return; }
+  const min = Math.floor((Date.now() - g.start) / 60000);
+  p.classList.remove('hidden');
+  p.innerHTML = `<b>GPS-Aufzeichnung läuft</b> seit ${min} Min. · ${(g.meter / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1 })} km · ${g.anzahl} Punkte
+    ${g.genau ? ` · Genauigkeit ${Math.round(g.genau)} m` : ''}${g.luecken ? ` · <span class="rot">${g.luecken} Lücke${g.luecken === 1 ? '' : 'n'}</span>` : ''}
+    <br><span class="small">Bildschirm anlassen und das Studio-Tool vorne lassen, sonst stoppt das iPhone die Aufzeichnung.</span>
+    <div class="btn-row"><button type="button" class="btn sm danger" id="gpsStopp">Stopp</button></div>`;
+  $('#gpsStopp').addEventListener('click', gpsStopp);
+}
+async function gpsStart(fahrt) {
+  const g = App.gps = { fahrt, start: Date.now(), puffer: [], anzahl: 0, meter: 0, luecken: 0, genau: 0, wake: null };
+  const wach = async () => { try { g.wake = await navigator.wakeLock?.request('screen'); } catch { /* nicht unterstützt */ } };
+  await wach();
+  g.sichtbar = () => { if (document.visibilityState === 'visible' && App.gps) wach(); };
+  document.addEventListener('visibilitychange', g.sichtbar);
+  g.watch = navigator.geolocation.watchPosition(pos => {
+    g.puffer.push({ t: new Date(pos.timestamp).toISOString(), lat: pos.coords.latitude, lon: pos.coords.longitude, acc: pos.coords.accuracy });
+    g.anzahl++; g.genau = pos.coords.accuracy; gpsAnzeige();
+  }, err => toast('GPS: ' + (err.code === 1 ? 'Standort nicht erlaubt' : 'kein Signal')), { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 });
+  g.timer = setInterval(gpsSenden, 15000);
+  gpsAnzeige();
+}
+async function gpsStopp() {
+  const g = App.gps;
+  if (!g) return;
+  navigator.geolocation.clearWatch(g.watch);
+  clearInterval(g.timer);
+  document.removeEventListener('visibilitychange', g.sichtbar);
+  try { await g.wake?.release(); } catch { /* egal */ }
+  await gpsSenden();
+  App.gps = null;
+  gpsAnzeige();
+  const [f, fahrzeuge, kunden, auftraege] = await Promise.all([api('fahrten/' + g.fahrt.id), api('fahrzeuge'), api('kunden'), api('auftraege')]);
+  const jetzt = new Date();
+  const vorschlag = f.km_start != null ? f.km_start + Math.round((f.strecke_m || 0) / 1000) : null;
+  fahrtDialog({ ...f, ende: `${String(jetzt.getHours()).padStart(2, '0')}:${String(jetzt.getMinutes()).padStart(2, '0')}`, km_ende: f.km_ende ?? vorschlag },
+    { fahrzeuge, kunden, auftraege }, { titel: 'Fahrt abschließen', hinweis: `GPS-Strecke ${((f.strecke_m || 0) / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1 })} km. Kilometerstand Ende bitte vom Tacho übernehmen, der Vorschlag ist nur gerechnet.` });
+}
+
+async function importDialog(d) {
+  const dlg = $('#modal');
+  dlg.innerHTML = `<form class="modal-box" id="imForm"><h2>Fahrten importieren (zum Beispiel aus Driversnote)</h2>
+    <p class="muted small">CSV-Datei wählen (Excel-Dateien vorher als CSV speichern). Danach die Spalten zuordnen. Doppelte Fahrten werden erkannt und übersprungen,
+      die Originaldatei wird aufbewahrt, importierte Fahrten sind als "Driversnote" markiert.</p>
+    <div class="field"><label for="imDatei">Datei</label><input class="input" type="file" id="imDatei" accept=".csv,text/csv" required></div>
+    <div id="imZuordnung"></div>
+    <div class="modal-foot"><span></span><span class="btn-row"><button type="button" class="btn" id="imZu">Abbrechen</button><button class="btn primary" id="imLos" disabled>Importieren</button></span></div></form>`;
+  dlg.showModal();
+  $('#imZu').addEventListener('click', () => dlg.close());
+  let dataUrl = '', name = '';
+  const FELDER = [['datum', 'Datum'], ['beginn', 'Uhrzeit Beginn'], ['ende', 'Uhrzeit Ende'], ['km_start', 'Tacho Beginn'], ['km_ende', 'Tacho Ende'],
+    ['strecke_km', 'Strecke (km)'], ['start_ort', 'Start'], ['ziel_ort', 'Ziel'], ['zweck', 'Zweck'], ['partner', 'Geschäftspartner'], ['art', 'Art (privat, geschäftlich)']];
+  $('#imDatei').addEventListener('change', async (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    name = file.name;
+    dataUrl = await new Promise(ok => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.readAsDataURL(file); });
+    try {
+      const v = await api('fahrtenbuch/import', 'POST', { data: dataUrl, nur_vorschau: true });
+      const raten = (k, t) => v.spalten.findIndex(sp => sp.toLowerCase().includes(t.toLowerCase().split(' ')[0]));
+      $('#imZuordnung').innerHTML = `<p class="small">${v.anzahl} Zeilen gefunden. Erste Zeile: ${esc(v.zeilen[0].join(' | '))}</p>
+        <div class="form-grid">
+        <div class="field"><label for="imFz">Fahrzeug</label><select class="input" id="imFz">${d.fahrzeuge.map(f => `<option value="${f.id}">${esc(f.name)} ${esc(f.kennzeichen || '')}</option>`).join('')}</select></div>
+        <div class="field"><label for="imFmt">Datumsformat</label><select class="input" id="imFmt">${['TT.MM.JJJJ', 'JJJJ-MM-TT', 'TT/MM/JJJJ', 'MM/TT/JJJJ'].map(x => `<option>${x}</option>`).join('')}</select></div>
+        ${FELDER.map(([k, t]) => `<div class="field"><label for="im_${k}">${t}</label><select class="input" id="im_${k}" data-feld="${k}"><option value="">nicht vorhanden</option>
+          ${v.spalten.map((sp, i) => `<option value="${i}"${raten(k, t) === i ? ' selected' : ''}>${esc(sp)}</option>`).join('')}</select></div>`).join('')}</div>`;
+      $('#imLos').disabled = false;
+    } catch (e) { toast(e.message); }
+  });
+  $('#imForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const zuordnung = {};
+    $$('[data-feld]', dlg).forEach(sel => { if (sel.value !== '') zuordnung[sel.dataset.feld] = Number(sel.value); });
+    try {
+      const r = await api('fahrtenbuch/import', 'POST', { data: dataUrl, name, fahrzeug_id: Number($('#imFz').value), zuordnung, datumsformat: $('#imFmt').value });
+      dlg.close();
+      alert(`${r.angelegt} Fahrten importiert, ${r.dubletten} doppelte übersprungen.${r.fehler.length ? '\n\nNicht übernommen:\n' + r.fehler.join('\n') : ''}`);
+      router();
+    } catch (e) { toast(e.message); }
+  });
+}
+
+App.pages.fahrten = async (view, ...rest) => {
+  const [fahrzeuge, alle, kunden, auftraege, pruefung, vorschlaege] = await Promise.all([api('fahrzeuge'), api('fahrten'), api('kunden'), api('auftraege'),
+    api('fahrtenbuch/pruefung'), api('fahrtenbuch/vorschlaege')]);
+  const d = { fahrzeuge, kunden, auftraege };
+  const fzFelder = [{ key: 'name', label: 'Name', required: true }, { key: 'kennzeichen', label: 'Kennzeichen' },
+    { key: 'km_start', label: 'Kilometerstand bei Beginn des Fahrtenbuchs', type: 'number' }, { key: 'aktiv', label: 'Aktiv', type: 'check', def: 1 }];
+  if (!fahrzeuge.length) {
+    view.innerHTML = head('Fahrtenbuch') + `<div class="card"><p>Zuerst ein Fahrzeug anlegen.</p><button class="btn primary" id="fzNeu">Fahrzeug anlegen</button></div>`;
+    $('#fzNeu').addEventListener('click', () => editRecord('fahrzeuge', 'Fahrzeug anlegen', fzFelder, {}));
+    return;
+  }
+  const fz = byId(fahrzeuge, Filter.fFz) || fahrzeuge.find(f => f.aktiv) || fahrzeuge[0];
+  const jahr = Number(rest[0] === 'druck' ? rest[1] : 0) || Filter.fJahr || new Date().getFullYear();
+  const fahrten = alle.filter(f => f.fahrzeug_id === fz.id && f.datum.startsWith(String(jahr)));
+  const aw = await api(`fahrtenbuch/auswertung?jahr=${jahr}&fahrzeug=${fz.id}`);
+  const warn = pruefung[String(fz.id)] || [];
+  const auswertung = `<table class="tbl"><tbody>${Object.entries(aw.km).map(([a, k]) => `<tr><td>${esc(a)}</td><td class="num">${k.toLocaleString('de-DE')} km</td>
+    <td class="num">${String(aw.anteil[a]).replace('.', ',')} %</td></tr>`).join('')}<tr class="summe"><td><b>Gesamt</b></td><td class="num"><b>${aw.gesamt.toLocaleString('de-DE')} km</b></td><td></td></tr></tbody></table>
+    ${aw.unvollstaendig ? `<p class="small rot">${aw.unvollstaendig} Fahrt${aw.unvollstaendig === 1 ? '' : 'en'} ohne vollständige Kilometerstände.</p>` : ''}`;
+  const tabelle = `<table class="tbl karten fahrten"><thead><tr><th>Datum</th><th>Strecke</th><th>Zweck</th><th>Art</th><th class="num">km</th><th></th></tr></thead><tbody>
+    ${fahrten.map(f => `<tr class="${f.art === 'storniert' ? 'muted' : ''}"><td class="k-datum nowrap">${datum(f.datum)}${f.beginn ? `<br><span class="muted small">${esc(f.beginn)}${f.ende ? ' bis ' + esc(f.ende) : ''}</span>` : ''}</td>
+      <td class="k-titel"><button type="button" class="linkbtn" data-fahrt="${f.id}"><b>${esc(f.start_ort || '?')} nach ${esc(f.ziel_ort || '?')}</b></button>
+        <br><span class="muted small">Tacho ${f.km_start ?? '?'} bis ${f.km_ende ?? '?'}</span></td>
+      <td class="k-kunde">${esc(f.zweck || '')}${f.partner ? `<br><span class="muted small">${esc(f.partner)}</span>` : ''}</td>
+      <td class="k-status"><span class="badge ${ART_BADGE[f.art] || 'plain'}">${esc(f.art)}</span>${f.quelle !== 'Hand' ? ` <span class="badge plain">${esc(f.quelle)}</span>` : ''}</td>
+      <td class="k-betrag num">${kmText(f)}${f.strecke_m ? `<br><span class="muted small">GPS ${(f.strecke_m / 1000).toLocaleString('de-DE', { maximumFractionDigits: 1 })} km${f.luecken ? ', Lücken' : ''}</span>` : ''}</td>
+      <td class="k-rest nowrap">${f.quelle === 'GPS' ? `<button type="button" class="btn sm" data-karte="${f.id}">Karte</button>` : ''}<button type="button" class="btn sm" data-verlauf="${f.id}">Verlauf</button></td></tr>`).join('')}
+    </tbody></table>`;
+
+  if (rest[0] === 'druck') {   // Druckansicht: im Browser "Drucken" und "Als PDF speichern"
+    view.innerHTML = `<div class="druck-kopf"><h1>Fahrtenbuch ${jahr}</h1><p>${esc(fz.name)} ${esc(fz.kennzeichen || '')}, erstellt am ${datum(isoTag(new Date()))}</p>
+      <div class="btn-row nicht-drucken"><button class="btn primary" id="drucken">Drucken oder als PDF speichern</button><a class="btn" href="#/fahrten">Zurück</a></div></div>
+      <h2>Auswertung</h2>${auswertung}<h2>Fahrten</h2>${tabelle.replace(/<td class="k-rest nowrap">[\s\S]*?<\/td><\/tr>/g, '</tr>').replace('<th></th>', '')}`;
+    $('#drucken').addEventListener('click', () => window.print());
+    return;
+  }
+
+  const jahre = [...new Set([new Date().getFullYear(), jahr, ...alle.map(f => Number(f.datum.slice(0, 4)))])].sort((a, b) => b - a);
+  const letzterKm = alle.filter(f => f.fahrzeug_id === fz.id && f.km_ende != null && f.art !== 'storniert')
+    .sort((a, b) => (b.datum + (b.beginn || '')).localeCompare(a.datum + (a.beginn || '')))[0]?.km_ende ?? fz.km_start;
+  view.innerHTML = head('Fahrtenbuch', 'Maßgeblich ist der Kilometerstand vom Tacho. Ob das Finanzamt das Fahrtenbuch anerkennt, entscheidet das Finanzamt.')
+    + `<div id="gpsPanel" class="gps-panel hidden" role="status"></div>
+    <div class="toolbar"><select class="input sm" id="fFz" aria-label="Fahrzeug">${fahrzeuge.map(f => `<option value="${f.id}"${f.id === fz.id ? ' selected' : ''}>${esc(f.name)} ${esc(f.kennzeichen || '')}</option>`).join('')}</select>
+      <select class="input sm" id="fJahr" aria-label="Jahr">${jahre.map(j => `<option${j === jahr ? ' selected' : ''}>${j}</option>`).join('')}</select>
+      <button class="btn primary" id="fNeu">Fahrt erfassen</button><button class="btn" id="gpsLos"${App.gps ? ' disabled' : ''}>GPS-Fahrt starten</button><button class="btn" id="fImport">Importieren</button></div>
+    <div class="grid">
+      ${warn.length ? `<div class="card"><h2>Kilometerfolge prüfen (${warn.length})</h2><ul class="kontakte">${warn.map(w => `<li><button type="button" class="linkbtn" data-fahrt="${w.fahrt_id}">${datum(w.datum)}</button>:
+        ${w.art} bei Kilometerstand ${w.ist}, erwartet ${w.erwartet} (${Math.abs(w.ist - w.erwartet)} km). Bitte mit Tacho, Werkstatt- und Tankbelegen abgleichen.</li>`).join('')}</ul></div>` : ''}
+      ${vorschlaege.length ? `<div class="card"><h2>Vorschläge aus Aufträgen</h2><ul class="kontakte">${vorschlaege.map(v => `<li><b>${datum(v.datum)}</b> ${esc(v.ort)}, ${esc(v.begegnung || '')}
+        <span class="muted small">(${esc(v.kunde || '')}, ${v.km} km einfach)</span> <button type="button" class="btn sm" data-vorschlag="${v.auftrag_id}">Als Fahrt übernehmen</button></li>`).join('')}</ul></div>` : ''}
+      <div class="card" id="fListe"><h2>Fahrten ${jahr} (${fahrten.length})</h2>${fahrten.length ? tabelle : '<p class="muted">Noch keine Fahrten in diesem Jahr.</p>'}</div>
+      <div class="grid g2">
+        <div class="card"><h2>Auswertung ${jahr}</h2>${auswertung}
+          <div class="btn-row"><a class="btn sm" href="/api/export/fahrten.csv?von=${jahr}-01-01&bis=${jahr}-12-31">CSV</a><a class="btn sm" href="#/fahrten/druck/${jahr}">Drucken oder PDF</a></div></div>
+        <div class="card" id="fzKarte"><h2>Fahrzeuge</h2><ul class="kontakte">${fahrzeuge.map(f => `<li><button type="button" class="linkbtn" data-fz="${f.id}"><b>${esc(f.name)}</b></button>
+          <span class="muted small">${esc(f.kennzeichen || '')}${f.km_start != null ? ', Anfangsstand ' + f.km_start : ''}</span>${f.aktiv ? '' : ' <span class="badge plain">inaktiv</span>'}</li>`).join('')}</ul>
+          <button type="button" class="btn sm" id="fzNeu">Fahrzeug hinzufügen</button></div>
+      </div>
+    </div>`;
+  gpsAnzeige();
+  $('#fFz').addEventListener('change', (ev) => { Filter.fFz = Number(ev.target.value); router(); });
+  $('#fJahr').addEventListener('change', (ev) => { Filter.fJahr = Number(ev.target.value); router(); });
+  $('#fNeu').addEventListener('click', () => fahrtDialog({ fahrzeug_id: fz.id, datum: isoTag(new Date()), km_start: letzterKm, art: 'betrieblich' }, d));
+  $('#fImport').addEventListener('click', () => importDialog(d));
+  $('#fzNeu').addEventListener('click', () => editRecord('fahrzeuge', 'Fahrzeug hinzufügen', fzFelder, {}));
+  $('#gpsLos').addEventListener('click', async () => {
+    if (!('geolocation' in navigator)) return toast('Dieses Gerät kann keinen Standort liefern.');
+    const jetzt = new Date();
+    const km = prompt('Kilometerstand vom Tacho zu Beginn:', letzterKm ?? '');
+    if (km === null) return;
+    try {
+      const f = await api('fahrten', 'POST', { fahrzeug_id: fz.id, datum: isoTag(jetzt), beginn: `${String(jetzt.getHours()).padStart(2, '0')}:${String(jetzt.getMinutes()).padStart(2, '0')}`,
+        km_start: km.trim() === '' ? '' : Number(km.replace(/\D/g, '')), quelle: 'GPS', art: 'betrieblich' });
+      await gpsStart(f);
+      $('#gpsLos').disabled = true;
+    } catch (e) { toast(e.message); }
+  });
+  $('.grid', view).addEventListener('click', (ev) => {
+    const b = ev.target.closest('button')?.dataset || {};
+    if (b.fahrt) fahrtDialog(byId(alle, b.fahrt), d);
+    if (b.karte) karteDialog(Number(b.karte)).catch(e => toast(e.message));
+    if (b.verlauf) verlaufDialog(Number(b.verlauf)).catch(e => toast(e.message));
+    if (b.fz) editRecord('fahrzeuge', 'Fahrzeug bearbeiten', fzFelder, byId(fahrzeuge, b.fz));
+    if (b.vorschlag) {
+      const v = vorschlaege.find(x => x.auftrag_id === Number(b.vorschlag));
+      fahrtDialog({ fahrzeug_id: fz.id, datum: v.datum, km_start: letzterKm, km_ende: letzterKm != null ? letzterKm + 2 * v.km : null, start_ort: 'Emden', ziel_ort: v.ort,
+        zweck: `Fotografie: ${v.begegnung || 'Auftrag'}`, partner: v.kunde, kunde_id: v.kunde_id, auftrag_id: v.auftrag_id, art: 'betrieblich' }, d,
+        { titel: 'Fahrt aus Auftrag', hinweis: `Vorschlag: ${v.km} km einfach, hin und zurück ${2 * v.km} km. Kilometerstände bitte vom Tacho übernehmen.` });
     }
   });
 };

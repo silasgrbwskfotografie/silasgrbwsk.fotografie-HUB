@@ -3,7 +3,8 @@
 Interne Arbeitsoberfläche für Aufträge, Zahlungen, Bildauslieferung und Verträge.
 Regeln und Server: `CLAUDE.md`. Funktionsumfang und Bauphasen: `PLANUNG.md`.
 
-Stand: **Phase 10** (Ausgaben mit Beleg als PDF oder Foto, Kategorien, Anlagegüter, Übersicht im Aufbau einer EÜR, Monatssperre mit Grund im Protokoll, Export von Einnahmen und Ausgaben als CSV und Belegen als ZIP).
+Stand: **Phase 11** (Fahrtenbuch: Fahrzeuge, Fahrten mit Tachoständen und Prüfung der Kilometerfolge, Änderungsverlauf, Storno statt Löschen, Monatssperre, Vorschläge aus Aufträgen, CSV-Import (Driversnote) mit Dubletten, GPS-Aufzeichnung mit Lücken, Karte mit OpenStreetMap, Jahresauswertung als CSV und Druck oder PDF).
+Davor Phase 10: Ausgaben mit Beleg als PDF oder Foto, Kategorien, Anlagegüter, Übersicht im Aufbau einer EÜR, Monatssperre mit Grund im Protokoll, Export von Einnahmen und Ausgaben als CSV und Belegen als ZIP.
 Davor Phase 9: Postfach aus dem Hub übernommen: mehrere Mailkonten, live per IMAP, Lesen nur als Text, Antworten, Weiterleiten, Erledigt, Löschen, Push bei neuen Mails, Kundenerkennung, Auftrag, Termin oder Aufgabe aus einer Mail, Textvorlagen.
 Davor Phase 8: Eigene Termine mit Wiederholung und Erinnerung, Kalender mit Woche und Tag, Warnung bei Überschneidungen, Aufgaben mit Ansichten und Vorlagen je Paket, wiederkehrende Aufgaben, Push-Erinnerungen, fremder Kalender per ICS-Link.
 Davor Phase 7: iPhone-App: Manifest, App-Symbole, Service Worker ohne Zwischenspeicher, Push-Mitteilungen mit VAPID wie im Hub, Zahl am App-Symbol, Installationshinweis.
@@ -64,6 +65,14 @@ Wiederherstellen: Server stoppen, die gewünschte Datei aus `data/backups` als `
 (vorhandene Dateien `studio.db-wal` und `studio.db-shm` löschen), Server starten.
 
 Die Kopien liegen auf demselben Rechner wie das Tool. Die Ablage außerhalb des Servers und die Sicherung der Uploads folgen in Phase 6.
+
+## Datenschutz (Hinweise für die Datenschutzerklärung, Inhalte von Silas)
+
+- Push-Mitteilungen laufen über den Push-Dienst des Geräts (Apple, Google, Mozilla), Inhalt nur Titel und kurzer Text, Ende-zu-Ende verschlüsselt.
+- Das Postfach liest live per IMAP beim jeweiligen Mailanbieter, Mails werden nicht in der Datenbank gespeichert, nur Verweise.
+- Die Karte im Fahrtenbuch lädt Kartenbilder von tile.openstreetmap.org; deren Server sehen IP-Adresse und angezeigte Gegend.
+- Ein eingebundener fremder Kalender wird vom Server abgerufen.
+- Hosting: netcup. Vertrag zur Auftragsverarbeitung prüfen.
 
 ## Tests
 

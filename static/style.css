@@ -269,3 +269,24 @@ summary{cursor:pointer}
 /* Phase 10: Ausgaben */
 .tbl tr.summe td{border-top:2px solid var(--ink-3)}
 h2.zwischen{margin-top:16px}
+
+/* Phase 11: Fahrtenbuch, Karte, Druck */
+.gps-panel{background:var(--ok-soft);color:var(--ink);border:1px solid var(--ok);border-radius:var(--radius);padding:12px 14px;margin-bottom:14px}
+.gps-panel.hidden{display:none}
+.karte{position:relative;width:100%;height:360px;overflow:hidden;border-radius:9px;background:#e8e4dc}
+.karte .kachel{position:absolute;width:256px;height:256px;max-width:none}
+.karte .strecke{position:absolute;left:0;top:0}
+.strecke .spur{stroke:#c0392b;stroke-width:4;stroke-linecap:round}
+.strecke .luecke{stroke:#c0392b;stroke-width:3;stroke-dasharray:6 6;opacity:.7}
+.strecke .start{fill:var(--ok);stroke:#fff;stroke-width:2}
+.strecke .ziel{fill:var(--ink);stroke:#fff;stroke-width:2}
+.osm-hinweis{position:absolute;right:0;bottom:0;background:rgba(255,255,255,.85);font-size:11px;padding:1px 5px}
+.druck-kopf h1{margin-bottom:4px}
+@media print{
+  #sidebar,#topbar,#tabbar,#navShade,.nicht-drucken,.toast{display:none!important}
+  body,#main,#view{background:#fff;padding:0;height:auto;overflow:visible}
+  .tbl.karten thead{display:table-header-group}
+  .tbl.karten,.tbl.karten tbody{display:table}
+  .tbl.karten tr{display:table-row}
+  .tbl{font-size:11px}
+}
