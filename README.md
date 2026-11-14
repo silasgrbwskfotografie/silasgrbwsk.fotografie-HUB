@@ -3,7 +3,8 @@
 Interne Arbeitsoberfläche für Aufträge, Zahlungen, Bildauslieferung und Verträge.
 Regeln und Server: `CLAUDE.md`. Funktionsumfang und Bauphasen: `PLANUNG.md`.
 
-Stand: **Phase 1** (Grundgerüst, Anmeldung mit Zwei-Faktor, Datenbank, Navigation).
+Stand: **Phase 2** (Kunden, Kontakte, Aufträge mit Preisberechnung, Statuswechsel, Liste mit Filtern, Pakete und Einstellungen bearbeiten).
+Davor Phase 1: Grundgerüst, Anmeldung mit Zwei-Faktor, Datenbank, Navigation.
 
 ## Lokal starten (Windows, PowerShell)
 

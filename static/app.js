@@ -1,4 +1,4 @@
-/* Studio-Tool: Kernfunktionen (API, Router, Formatierung) und die Seiten von Phase 1 */
+/* Studio-Tool: Kernfunktionen (API, Router, Formatierung), Startseite und Sicherheit. Weitere Seiten: pages.js */
 
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
@@ -91,8 +91,6 @@ function head(title, sub) {
 
 /* Seiten, die in späteren Phasen gebaut werden */
 const LATER = {
-  auftraege: [2, 'Kunden anlegen, Aufträge mit Paket, Preis und Anfahrt, Status, Liste mit Filtern.'],
-  kunden: [2, 'Vereine, Sparten und Einzelpersonen mit Ansprechpersonen.'],
   zahlungen: [3, 'Zahlstatus, Zahler, Finom-Häkchen mit Rechnungsnummer, Umsatz und CSV-Export.'],
   lieferung: [4, 'Galerie-Links mit Ablaufdatum, Lieferfrist-Ampel und Nachrichtenvorlagen.'],
   vertraege: [5, 'Verträge mit Fristen, PDF-Upload und geschütztem Download.'],
@@ -114,7 +112,7 @@ App.pages.start = async (view) => {
   view.innerHTML = head('Hallo ' + (App.me.display_name || App.me.username), 'Heute ist der ' + datum(iso))
     + `<div class="grid g2">
       <div class="card"><h2>Stand</h2>
-        <p>Phase 1 ist eingerichtet: Anmeldung, Datenbank, Navigation.</p>
+        <p>Phase 2 ist eingerichtet: Kunden, Kontakte und Aufträge mit Preisberechnung.</p>
         <p class="muted small">Termine, Lieferungen, offene Zahlungen und Umsatz erscheinen hier ab Phase 6.</p></div>
       <div class="card"><h2>Pakete</h2>${paketTabelle(pakete)}
         <p class="muted small">Anfahrt: ${esc(s.anfahrt_frei_km)} km frei, danach ${euro(s.anfahrt_cent_je_km)} je km.</p></div>
@@ -128,22 +126,6 @@ function paketTabelle(pakete) {
       <td class="small">${p.inkl_spieler ? `bis ${p.inkl_spieler} Spieler, jeder weitere ${euro(p.zusatzspieler_cent)}` : ''}</td></tr>`).join('')
     + '</tbody></table>';
 }
-
-App.pages.einstellungen = async (view) => {
-  const [pakete, s] = await Promise.all([api('pakete'), api('einstellungen')]);
-  const grenze = s.umsatzgrenze_cent === '' ? '<span class="badge warn">noch offen</span>' : euro(s.umsatzgrenze_cent);
-  view.innerHTML = head('Einstellungen', 'Bearbeiten folgt in Phase 2')
-    + `<div class="grid g2">
-      <div class="card"><h2>Pakete</h2>${paketTabelle(pakete)}</div>
-      <div class="card"><h2>Werte</h2><table class="tbl"><tbody>
-        <tr><td>Anfahrt frei bis</td><td class="num">${esc(s.anfahrt_frei_km)} km</td></tr>
-        <tr><td>Preis je weiterem km</td><td class="num">${euro(s.anfahrt_cent_je_km)}</td></tr>
-        <tr><td>Lieferfrist nach dem Spiel</td><td class="num">${esc(s.lieferfrist_tage)} Tage</td></tr>
-        <tr><td>Picdrop-Laufzeit</td><td class="num">${esc(s.picdrop_tage)} Tage</td></tr>
-        <tr><td>Umsatzgrenze</td><td class="num">${grenze}</td></tr>
-      </tbody></table></div>
-    </div>`;
-};
 
 /* ---------- Sicherheit: Zwei-Faktor-Anmeldung (wie im Hub) ---------- */
 App.pages.sicherheit = async (view) => {

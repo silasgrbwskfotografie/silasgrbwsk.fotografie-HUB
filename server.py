@@ -34,13 +34,13 @@ import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
 
-VERSION = "0.1"
+VERSION = "0.2"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -121,8 +121,12 @@ TABLES = {
         "spieler": "INTEGER DEFAULT 0",
         # beim Anlegen festgeschrieben, spätere Paketpreise ändern alte Aufträge nicht
         "grundpreis_cent": "INTEGER DEFAULT 0",
-        "zusatzspieler_cent": "INTEGER DEFAULT 0",
-        "anfahrt_cent": "INTEGER DEFAULT 0",
+        "inkl_spieler": "INTEGER DEFAULT 0",
+        "zusatz_je_spieler_cent": "INTEGER DEFAULT 0",
+        "anfahrt_frei_km": "INTEGER DEFAULT 0",
+        "anfahrt_cent_je_km": "INTEGER DEFAULT 0",
+        "zusatzspieler_cent": "INTEGER DEFAULT 0",       # Summe für alle Zusatzspieler
+        "anfahrt_cent": "INTEGER DEFAULT 0",             # Summe Anfahrt
         "betrag_cent": "INTEGER DEFAULT 0",
         "betrag_manuell": "INTEGER DEFAULT 0",           # 1 = Betrag von Hand überschrieben
         "lieferfrist": "TEXT",
@@ -665,6 +669,119 @@ def twofa_reset(username):
         audit(conn, "System", "Zwei-Faktor-Anmeldung zurückgesetzt", "users", row["id"], username)
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: Kunden, Kontakte, Pakete, Aufträge (allgemeine Tabellen-Schnittstelle wie api_table im Hub)
+# ---------------------------------------------------------------------------
+API_TABLES = ("kunden", "kontakte", "pakete", "auftraege")
+ORDER = {"kunden": "name COLLATE NOCASE, id", "kontakte": "name COLLATE NOCASE, id", "pakete": "sort, id",
+         "auftraege": "datum, uhrzeit, id"}
+# Diese Felder setzt nur der Server (Preise, Fristen, Zeitstempel)
+SERVER_FIELDS = {
+    "kunden": ("erstellt_am", "geaendert_am"),
+    "kontakte": ("erstellt_am", "geaendert_am", "anonymisiert"),
+    "auftraege": ("erstellt_am", "geaendert_am", "serie", "grundpreis_cent", "inkl_spieler", "zusatz_je_spieler_cent",
+                  "anfahrt_frei_km", "anfahrt_cent_je_km", "zusatzspieler_cent", "anfahrt_cent", "lieferfrist"),
+}
+AUDIT_SKIP = ("erstellt_am", "geaendert_am")
+EDITABLE_SETTINGS = ("anfahrt_frei_km", "anfahrt_cent_je_km", "lieferfrist_tage", "picdrop_tage", "umsatzgrenze_cent")
+
+
+class BadRequest(Exception):
+    pass
+
+
+def preis(grund, inkl, je_spieler, spieler, km, frei_km, cent_je_km):
+    """Preis in Cent: (Zusatzspieler, Anfahrt, Summe). inkl = 0 heißt: Paket ohne Spielerstaffel.
+    km ist die einfache Strecke ab Emden, berechnet wird nur, was über frei_km liegt."""
+    zusatz = max(0, spieler - inkl) * je_spieler if inkl else 0
+    anfahrt = max(0, km - frei_km) * cent_je_km
+    return zusatz, anfahrt, grund + zusatz + anfahrt
+
+
+def clean_values(table, data):
+    """Nur bekannte Spalten, Zahlen als ganze Zahl ab 0, Texte gekürzt."""
+    cols = TABLES[table]
+    out = {}
+    for k, v in data.items():
+        if k not in cols:
+            continue
+        if "INTEGER" in cols[k]:
+            if v in ("", None):
+                v = None
+            else:
+                try:
+                    v = int(v) if not isinstance(v, float) or v.is_integer() else None
+                except (TypeError, ValueError):
+                    v = None
+                if v is None or not 0 <= v < 10 ** 9:
+                    raise BadRequest(f"{k}: bitte eine ganze Zahl ab 0 eingeben.")
+        else:
+            v = None if v is None else str(v).strip()[:10000 if k == "notizen" else 500]
+        out[k] = v
+    return out
+
+
+def check_row(conn, table, row):
+    """Pflichtfelder und erlaubte Werte. Ungültige Verweise fängt die Datenbank ab (foreign_keys)."""
+    if table in ("kunden", "kontakte", "pakete") and not row.get("name"):
+        raise BadRequest("Bitte einen Namen eingeben.")
+    if table == "kunden":
+        if row.get("typ") not in KUNDEN_TYPEN:
+            raise BadRequest("Unbekannter Kundentyp.")
+        if row.get("parent_id"):
+            parent = conn.execute("SELECT parent_id FROM kunden WHERE id=?", (row["parent_id"],)).fetchone()
+            # nur eine Ebene (Sparte gehört zu Verein), damit kein Kreis entstehen kann
+            if not parent or parent["parent_id"] or row["parent_id"] == row.get("id"):
+                raise BadRequest("Der übergeordnete Kunde passt nicht (er darf selbst keinem Kunden untergeordnet sein).")
+            if row.get("id") and conn.execute("SELECT 1 FROM kunden WHERE parent_id=?", (row["id"],)).fetchone():
+                raise BadRequest("Diesem Kunden sind schon andere untergeordnet, er kann selbst nicht untergeordnet werden.")
+    if table == "kontakte" and not row.get("kunde_id"):
+        raise BadRequest("Der Kontakt braucht einen Kunden.")
+    if table == "auftraege":
+        if not row.get("kunde_id") or not row.get("paket_id"):
+            raise BadRequest("Bitte Kunde und Paket wählen.")
+        try:
+            date.fromisoformat(row.get("datum") or "")
+        except ValueError:
+            raise BadRequest("Bitte ein gültiges Datum eingeben.")
+        if row.get("uhrzeit") and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", row["uhrzeit"]):
+            raise BadRequest("Uhrzeit bitte als HH:MM.")
+        if row.get("status") not in STATUS_AUFTRAG:
+            raise BadRequest("Unbekannter Status.")
+
+
+def auftrag_preise(conn, row, old):
+    """Preisfelder eines Auftrags. Die Preise werden beim Anlegen festgeschrieben: spätere Änderungen an Kilometern
+    oder Spielern rechnen mit den alten Preisen, nur ein Paketwechsel holt die aktuellen Preise des neuen Pakets."""
+    out = {}
+    if not old or old["paket_id"] != row["paket_id"]:
+        p = conn.execute("SELECT * FROM pakete WHERE id=?", (row["paket_id"],)).fetchone()
+        if not p:
+            raise BadRequest("Dieses Paket gibt es nicht.")
+        out.update(grundpreis_cent=p["grundpreis_cent"] or 0, inkl_spieler=p["inkl_spieler"] or 0,
+                   zusatz_je_spieler_cent=p["zusatzspieler_cent"] or 0)
+    if not old:
+        out.update(anfahrt_frei_km=int(get_setting(conn, "anfahrt_frei_km") or 0),
+                   anfahrt_cent_je_km=int(get_setting(conn, "anfahrt_cent_je_km") or 0))
+    f = {**row, **out}
+    zusatz, anfahrt, summe = preis(f["grundpreis_cent"] or 0, f["inkl_spieler"] or 0, f["zusatz_je_spieler_cent"] or 0,
+                                   f.get("spieler") or 0, f.get("km") or 0, f["anfahrt_frei_km"] or 0, f["anfahrt_cent_je_km"] or 0)
+    out.update(zusatzspieler_cent=zusatz, anfahrt_cent=anfahrt, berechnet_cent=summe,
+               betrag_cent=(row.get("betrag_cent") or 0) if row.get("betrag_manuell") else summe)
+    return out
+
+
+def vals_id(data):
+    v = data.get("id")
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def audit_label(table, r):
+    if table == "auftraege":
+        return f"{datum_text(r['datum'])} {r['begegnung'] or ''}".strip()
+    return r["name"] or ""
+
+
 class _Discard:
     """Bei HEAD-Anfragen: Inhalt verwerfen, Leeren und Schließen an die echte Verbindung weitergeben."""
     def __init__(self, real):
@@ -838,6 +955,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Anfrage zu groß"}, 413)
         except BadRequest as e:
             self.send_json({"error": str(e)}, 400)
+        except sqlite3.IntegrityError:   # foreign_keys: Verweis ungültig oder es hängt noch etwas an dem Eintrag
+            self.send_json({"error": "Das geht nicht: Der Eintrag wird noch verwendet oder verweist auf etwas, das es nicht gibt. "
+                                     "Benutzte Einträge bitte archivieren statt löschen."}, 400)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -989,15 +1109,98 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "Bitte zuerst die Zwei-Faktor-Anmeldung einrichten.", "need_2fa": True}, 403)
         if method == "GET" and head == "me":
             return self.send_json({"user": user, "version": VERSION, "domain": DOMAIN})
-        if method == "GET" and head == "pakete":
+        if method == "POST" and p == ["auftraege", "vorschau"]:   # Preis für das Formular, speichert nichts
+            data = self.read_json()
+            vals = clean_values("auftraege", data)
+            if not vals.get("paket_id"):
+                raise BadRequest("Bitte ein Paket wählen.")
             with db() as conn:
-                rows = [row_dict(r) for r in conn.execute("SELECT * FROM pakete ORDER BY sort, id")]
-            return self.send_json(rows)
-        if method == "GET" and head == "einstellungen":
+                old = conn.execute("SELECT * FROM auftraege WHERE id=?", (vals_id(data),)).fetchone()
+                row = {**(row_dict(old) if old else {}), **vals}
+                fest = ("grundpreis_cent", "inkl_spieler", "zusatz_je_spieler_cent", "anfahrt_frei_km", "anfahrt_cent_je_km")
+                return self.send_json({**{k: row.get(k) for k in fest}, **auftrag_preise(conn, row, old)})
+        if head in API_TABLES and (len(p) == 1 or (len(p) == 2 and re.fullmatch(r"[0-9]{1,9}", p[1]))):
+            return self.api_table(method, head, int(p[1]) if len(p) == 2 else None, user)
+        if head == "einstellungen" and not p[1:]:
             with db() as conn:
-                out = {k: get_setting(conn, k) for k in DEFAULT_SETTINGS}
-            return self.send_json(out)
+                if method == "PUT":
+                    data = self.read_json()
+                    changes = {}
+                    for k in EDITABLE_SETTINGS:
+                        if k not in data:
+                            continue
+                        v = str(data[k]).strip()
+                        if not (re.fullmatch(r"[0-9]{1,9}", v) or (v == "" and k == "umsatzgrenze_cent")):
+                            raise BadRequest(f"{k}: bitte eine ganze Zahl ab 0 eingeben.")
+                        alt = get_setting(conn, k)
+                        if alt != v:
+                            set_setting(conn, k, v)
+                            changes[k] = [alt, v]
+                    if changes:
+                        audit(conn, user, "geändert", "settings", None, "Einstellungen", changes)
+                elif method != "GET":
+                    return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+                return self.send_json({k: get_setting(conn, k) for k in DEFAULT_SETTINGS})
         return self.send_json({"error": "Unbekannte Schnittstelle"}, 404)
+
+    # -- Tabellen (/api/<tabelle>[/<id>]) ----------------------------------
+    def api_table(self, method, table, rid, user):
+        cols = TABLES[table]
+        now = now_iso()
+        with db() as conn:
+            old = conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone() if rid is not None else None
+            if rid is not None and not old:
+                return self.send_json({"error": "Diesen Eintrag gibt es nicht."}, 404)
+            if method == "GET":
+                if old:
+                    return self.send_json(row_dict(old))
+                return self.send_json([row_dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY {ORDER[table]}")])
+
+            if (method == "POST" and rid is None) or (method == "PUT" and old):
+                vals = clean_values(table, self.read_json())
+                for f in SERVER_FIELDS.get(table, ()):
+                    vals.pop(f, None)
+                if not old:   # Vorgaben, damit die Prüfung auch beim Anlegen greift
+                    for k, d in (("typ", "Verein"), ("status", "Angefragt")):
+                        if k in cols and table in ("kunden", "auftraege") and not vals.get(k):
+                            vals[k] = d
+                row = {**(row_dict(old) if old else {}), **vals}
+                check_row(conn, table, row)
+                if table == "auftraege":
+                    pr = auftrag_preise(conn, row, old)
+                    pr.pop("berechnet_cent")
+                    vals.update(pr)
+                    if not old or old["datum"] != row["datum"]:
+                        tage = int(get_setting(conn, "lieferfrist_tage") or 0)
+                        vals["lieferfrist"] = (date.fromisoformat(row["datum"]) + timedelta(days=tage)).isoformat()
+                if "geaendert_am" in cols:
+                    vals["geaendert_am"] = now
+                if old:
+                    if vals:
+                        conn.execute(f"UPDATE {table} SET {', '.join(k + '=?' for k in vals)} WHERE id=?", list(vals.values()) + [rid])
+                    changes = {k: [old[k], v] for k, v in vals.items()
+                               if k not in AUDIT_SKIP and str(old[k] if old[k] is not None else "") != str(v if v is not None else "")}
+                else:
+                    if "erstellt_am" in cols:
+                        vals["erstellt_am"] = now
+                    rid = conn.execute(f"INSERT INTO {table} ({', '.join(vals)}) VALUES ({', '.join('?' for _ in vals)})",
+                                       list(vals.values())).lastrowid
+                    changes = {k: v for k, v in vals.items() if k not in AUDIT_SKIP and v not in (None, "")}
+                r = conn.execute(f"SELECT * FROM {table} WHERE id=?", (rid,)).fetchone()
+                if changes:
+                    audit(conn, user, "geändert" if old else "neu", table, rid, audit_label(table, r), changes)
+                return self.send_json(row_dict(r), 200 if old else 201)
+
+            if method == "DELETE" and old:
+                # Endgültig löschen geht nur, wenn nichts daran hängt: sonst meldet die Datenbank einen Fehler
+                # (IntegrityError, siehe handle_request) und alles wird zurückgerollt.
+                if table == "kunden":
+                    conn.execute("DELETE FROM kontakte WHERE kunde_id=?", (rid,))
+                conn.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
+                audit(conn, user, "gelöscht", table, rid, audit_label(table, old),
+                      {k: v for k, v in row_dict(old).items() if k not in AUDIT_SKIP and v not in (None, "")})
+                return self.send_json({"ok": True})
+        return self.send_json({"error": "Methode nicht erlaubt"}, 405)
 
     # -- Zwei-Faktor des eigenen Kontos (/api/me/2fa) ----------------------
     def api_twofa(self, method, p, user):
@@ -1065,10 +1268,6 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("DELETE FROM user_2fa WHERE user_id=?", (uid,))
             audit(conn, user, "Zwei-Faktor-Anmeldung ausgeschaltet", "users", uid, user["username"])
             return self.send_json({"ok": True})
-
-
-class BadRequest(Exception):
-    pass
 
 
 def cli():

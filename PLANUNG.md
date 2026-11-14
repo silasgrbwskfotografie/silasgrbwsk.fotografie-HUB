@@ -200,6 +200,9 @@ Regeln für die Umsetzung:
 - Der Betrag wird beim Anlegen aus Paket, Zusatzspielern und Anfahrt berechnet und dann im Auftrag festgeschrieben. Spätere Preisänderungen am Paket ändern alte Aufträge nicht.
 - Nichts wird hart gelöscht, was eine Zahlung hat. Stattdessen Status Abgesagt oder Archiviert.
 - Die Startdaten (deine Pakete und Einstellungen) kommen über ein Seed-Skript.
+- Entschieden am 14.11.2026 (Phase 2): Ändern sich bei einem bestehenden Auftrag Kilometer oder Spielerzahl, wird mit den Preisen vom Anlegen gerechnet. Nur ein Paketwechsel holt die aktuellen Preise des neuen Pakets. Von Hand gesetzte Beträge bleiben stehen.
+- Entschieden am 14.11.2026 (Phase 2): Kunden und Aufträge werden archiviert. Endgültig löschen geht nur, wenn nichts daran hängt (Kunde ohne Aufträge, Auftrag ohne Zahlung, Kontakt nicht als Zahler, Paket ohne Aufträge).
+- Entschieden am 14.11.2026 (Phase 2): Sportart ist ein freies Textfeld, bereits benutzte Sportarten werden vorgeschlagen.
 
 ## Technik und Architektur
 
