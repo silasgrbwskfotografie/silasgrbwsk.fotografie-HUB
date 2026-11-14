@@ -48,7 +48,8 @@ function readForm(form, fields) {
   return out;
 }
 
-/* Dialog zum Anlegen und Bearbeiten. opts: fix (feste Werte), extra (HTML unter den Feldern), bind(form) */
+/* Dialog zum Anlegen und Bearbeiten. opts: fix (feste Werte), extra (HTML unter den Feldern), bind(form),
+   danach(was, gespeichert) statt Neuzeichnen der Seite. was: 'save' | 'arch' | 'del' */
 function editRecord(table, title, fields, rec = {}, opts = {}) {
   const dlg = $('#modal');
   const archivierbar = rec.id && 'archiviert' in rec;
@@ -60,23 +61,22 @@ function editRecord(table, title, fields, rec = {}, opts = {}) {
     </span><span class="btn-row"><button type="button" class="btn" data-act="close">Abbrechen</button>
       <button class="btn primary">Speichern</button></span></div></form>`;
   const form = $('form', dlg);
-  const fertig = (msg) => { dlg.close(); toast(msg); router(); };
+  const fertig = (msg, was, r) => { dlg.close(); toast(msg); (opts.danach || router)(was, r); };
   const url = table + (rec.id ? '/' + rec.id : '');
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     try {
-      await api(url, rec.id ? 'PUT' : 'POST', { ...readForm(form, fields), ...(opts.fix || {}) });
-      fertig('Gespeichert');
+      fertig('Gespeichert', 'save', await api(url, rec.id ? 'PUT' : 'POST', { ...readForm(form, fields), ...(opts.fix || {}) }));
     } catch (e) { toast(e.message); }
   });
   form.addEventListener('click', async (ev) => {
     const act = ev.target.dataset.act;
     if (act === 'close') return dlg.close();
     try {
-      if (act === 'arch') { await api(url, 'PUT', { archiviert: rec.archiviert ? 0 : 1 }); fertig(rec.archiviert ? 'Wiederhergestellt' : 'Archiviert'); }
+      if (act === 'arch') { await api(url, 'PUT', { archiviert: rec.archiviert ? 0 : 1 }); fertig(rec.archiviert ? 'Wiederhergestellt' : 'Archiviert', 'arch'); }
       if (act === 'del' && confirm('Diesen Eintrag endgültig löschen? Das lässt sich nicht rückgängig machen.')) {
         await api(url, 'DELETE');
-        fertig('Gelöscht');
+        fertig('Gelöscht', 'del');
       }
     } catch (e) { toast(e.message); }
   });
@@ -145,15 +145,14 @@ App.pages.kunden = async (view) => {
 };
 
 /* ---------- Aufträge ---------- */
-App.pages.auftraege = async (view) => {
-  const [auftraege, kunden, pakete] = await Promise.all([api('auftraege'), api('kunden'), api('pakete')]);
-  const sportarten = [...new Set(auftraege.map(a => a.sportart).filter(Boolean))].sort();
-
-  const felder = (a) => [
+/* Dialog für einen Auftrag. d: { auftraege, kunden, pakete }, opts wie bei editRecord */
+function auftragDialog(a, d, opts = {}) {
+  const sportarten = [...new Set(d.auftraege.map(x => x.sportart).filter(Boolean))].sort();
+  const felder = [
     { key: 'kunde_id', label: 'Kunde', type: 'select', required: true,
-      options: [['', 'bitte wählen']].concat(kunden.filter(k => !k.archiviert || k.id === a.kunde_id).map(k => [k.id, k.name])) },
+      options: [['', 'bitte wählen']].concat(d.kunden.filter(k => !k.archiviert || k.id === a.kunde_id).map(k => [k.id, k.name])) },
     { key: 'paket_id', label: 'Paket', type: 'select', required: true,
-      options: [['', 'bitte wählen']].concat(pakete.filter(p => p.aktiv || p.id === a.paket_id).map(p => [p.id, `${p.name} (${euro(p.grundpreis_cent)})`])) },
+      options: [['', 'bitte wählen']].concat(d.pakete.filter(p => p.aktiv || p.id === a.paket_id).map(p => [p.id, `${p.name} (${euro(p.grundpreis_cent)})`])) },
     { key: 'datum', label: 'Datum', type: 'date', required: true },
     { key: 'uhrzeit', label: 'Uhrzeit', type: 'time' },
     { key: 'begegnung', label: 'Begegnung oder Anlass', full: true },
@@ -161,14 +160,13 @@ App.pages.auftraege = async (view) => {
     { key: 'sportart', label: 'Sportart', list: sportarten },
     { key: 'spieler', label: 'Anzahl Spieler (für Spielershooting)', type: 'number' },
     { key: 'km', label: 'Kilometer, einfache Strecke ab Emden', type: 'number' },
-    { key: 'status', label: 'Status', type: 'select', options: STATUS_AUFTRAG.map(s => [s, s]), def: 'Angefragt' },
+    { key: 'status', label: 'Status', type: 'select', options: STATUS_AUFTRAG.map(x => [x, x]), def: 'Angefragt' },
     { key: 'betrag_manuell', label: 'Betrag von Hand festlegen', type: 'check' },
     { key: 'betrag_cent', label: 'Betrag in Euro', type: 'euro' },
     { key: 'notizen', label: 'Notizen', type: 'textarea', full: true },
   ];
-
   // Preis im Formular: rechnet der Server (eine Stelle für die Preislogik), gespeichert wird dabei nichts
-  const preisBinden = (a) => (form) => {
+  const bind = (form) => {
     const box = $('#preisBox', form);
     const el = form.elements;
     let timer;
@@ -187,13 +185,16 @@ App.pages.auftraege = async (view) => {
     ['paket_id', 'spieler', 'km', 'betrag_manuell'].forEach(k => el[k].addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(rechnen, 250); }));
     rechnen();
   };
-  const oeffnen = (a) => editRecord('auftraege', a.id ? 'Auftrag bearbeiten' : 'Auftrag anlegen', felder(a), a,
-    { extra: `<p class="preisbox" id="preisBox" role="status"></p>${a.lieferfrist ? `<p class="muted small">Lieferfrist: ${datum(a.lieferfrist)}</p>` : ''}`, bind: preisBinden(a) });
+  editRecord('auftraege', opts.titel || (a.id ? 'Auftrag bearbeiten' : 'Auftrag anlegen'), felder, a,
+    { ...opts, bind, extra: '<p class="preisbox" id="preisBox" role="status"></p>' });
+}
 
+App.pages.auftraege = async (view) => {
+  const [auftraege, kunden, pakete] = await Promise.all([api('auftraege'), api('kunden'), api('pakete')]);
   view.innerHTML = head('Aufträge und Spiele')
     + `<div class="toolbar"><button class="btn primary" id="aNeu">Auftrag anlegen</button>
       <select class="input" id="aKunde" aria-label="Kunde"><option value="">Alle Kunden</option>${kunden.map(k => `<option value="${k.id}"${String(k.id) === Filter.aKunde ? ' selected' : ''}>${esc(k.name)}</option>`).join('')}</select>
-      <select class="input" id="aStatus" aria-label="Status"><option value="">Jeder Status</option>${STATUS_AUFTRAG.map(s => `<option${s === Filter.aStatus ? ' selected' : ''}>${s}</option>`).join('')}</select>
+      <select class="input" id="aStatus" aria-label="Status"><option value="">Jeder Status</option>${STATUS_AUFTRAG.map(x => `<option${x === Filter.aStatus ? ' selected' : ''}>${x}</option>`).join('')}</select>
       <label class="check">von <input class="input" type="date" id="aVon" value="${esc(Filter.aVon)}"></label>
       <label class="check">bis <input class="input" type="date" id="aBis" value="${esc(Filter.aBis)}"></label>
       <label class="check"><input type="checkbox" id="aArchiv"${Filter.aArchiv ? ' checked' : ''}> Archivierte zeigen</label></div>
@@ -205,26 +206,24 @@ App.pages.auftraege = async (view) => {
       $('#aListe').innerHTML = `<p class="muted">${auftraege.length ? 'Kein Auftrag passt zum Filter.' : 'Noch keine Aufträge. Lege zuerst einen Kunden an, dann den ersten Auftrag.'}</p>`;
       return;
     }
-    const summe = liste.filter(a => a.status !== 'Abgesagt').reduce((s, a) => s + a.betrag_cent, 0);
-    $('#aListe').innerHTML = `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Datum</th><th>Begegnung</th><th>Kunde</th><th>Paket</th><th>Status</th><th class="num">Betrag</th></tr></thead><tbody>`
+    const summe = liste.filter(a => a.status !== 'Abgesagt').reduce((sum, a) => sum + a.betrag_cent, 0);
+    // auf dem Handy wird jede Zeile zur Karte (style.css: .tbl.karten)
+    $('#aListe').innerHTML = `<table class="tbl karten"><thead><tr><th>Datum</th><th>Begegnung</th><th>Kunde</th><th>Paket</th><th>Status</th><th class="num">Betrag</th></tr></thead><tbody>`
       + liste.map(a => `<tr${a.archiviert || a.status === 'Abgesagt' ? ' class="muted"' : ''}>
-        <td class="nowrap">${datum(a.datum)}${a.uhrzeit ? `<br><span class="muted small">${esc(a.uhrzeit)} Uhr</span>` : ''}</td>
-        <td><button type="button" class="linkbtn" data-auftrag="${a.id}"><b>${esc(a.begegnung || 'ohne Titel')}</b></button>
+        <td class="k-datum nowrap">${datum(a.datum)}${a.uhrzeit ? ` <span class="muted small">${esc(a.uhrzeit)} Uhr</span>` : ''}</td>
+        <td class="k-titel"><a class="linkbtn" href="#/auftrag/${a.id}"><b>${esc(a.begegnung || 'ohne Titel')}</b></a>
           ${a.ort || a.sportart ? `<br><span class="muted small">${[a.sportart, a.ort].filter(Boolean).map(esc).join(' · ')}</span>` : ''}</td>
-        <td>${esc(byId(kunden, a.kunde_id)?.name || '')}</td><td>${esc(byId(pakete, a.paket_id)?.name || '')}</td>
-        <td><select class="input sm" data-status="${a.id}" aria-label="Status ändern">${STATUS_AUFTRAG.map(s => `<option${s === a.status ? ' selected' : ''}>${s}</option>`).join('')}</select></td>
-        <td class="num">${euro(a.betrag_cent)}${a.betrag_manuell ? '<br><span class="muted small">von Hand</span>' : ''}</td></tr>`).join('')
-      + `</tbody></table></div><p class="muted small">${liste.length} ${liste.length === 1 ? 'Auftrag' : 'Aufträge'}, Summe ohne abgesagte: <b>${euro(summe)}</b></p>`;
+        <td class="k-kunde">${esc(byId(kunden, a.kunde_id)?.name || '')}</td><td class="k-paket">${esc(byId(pakete, a.paket_id)?.name || '')}</td>
+        <td class="k-status"><select class="input sm" data-status="${a.id}" aria-label="Status ändern">${STATUS_AUFTRAG.map(x => `<option${x === a.status ? ' selected' : ''}>${x}</option>`).join('')}</select></td>
+        <td class="k-betrag num">${euro(a.betrag_cent)}${a.betrag_manuell ? ' <span class="muted small">von Hand</span>' : ''}</td></tr>`).join('')
+      + `</tbody></table><p class="muted small">${liste.length} ${liste.length === 1 ? 'Auftrag' : 'Aufträge'}, Summe ohne abgesagte: <b>${euro(summe)}</b></p>`;
   };
   draw();
-  $('#aNeu').addEventListener('click', () => oeffnen({}));
-  [['aKunde', 'aKunde'], ['aStatus', 'aStatus'], ['aVon', 'aVon'], ['aBis', 'aBis']].forEach(([id, key]) =>
-    $('#' + id).addEventListener('change', (ev) => { Filter[key] = ev.target.value; draw(); }));
+  $('#aNeu').addEventListener('click', () => auftragDialog({}, { auftraege, kunden, pakete },
+    { danach: (was, r) => { location.hash = '#/auftrag/' + r.id; } }));
+  ['aKunde', 'aStatus', 'aVon', 'aBis'].forEach(key =>
+    $('#' + key).addEventListener('change', (ev) => { Filter[key] = ev.target.value; draw(); }));
   $('#aArchiv').addEventListener('change', (ev) => { Filter.aArchiv = ev.target.checked; draw(); });
-  $('#aListe').addEventListener('click', (ev) => {
-    const id = ev.target.closest('button')?.dataset.auftrag;
-    if (id) oeffnen(byId(auftraege, id));
-  });
   $('#aListe').addEventListener('change', async (ev) => {
     const id = ev.target.dataset.status;
     if (!id) return;
@@ -236,9 +235,71 @@ App.pages.auftraege = async (view) => {
   });
 };
 
+/* ---------- Ein Auftrag: alles an einer Stelle (#/auftrag/<id>) ---------- */
+App.pages.auftrag = async (view, id) => {
+  const [a, auftraege, kunden, pakete, kontakte] = await Promise.all(
+    [api('auftraege/' + Number(id)), api('auftraege'), api('kunden'), api('pakete'), api('kontakte')]);
+  const kunde = byId(kunden, a.kunde_id) || {};
+  const zusatzN = a.inkl_spieler ? Math.max(0, (a.spieler || 0) - a.inkl_spieler) : 0;
+  const kmN = Math.max(0, (a.km || 0) - a.anfahrt_frei_km);
+  const berechnet = a.grundpreis_cent + a.zusatzspieler_cent + a.anfahrt_cent;
+  const zeile = (k, v) => v ? `<tr><td class="muted">${k}</td><td>${v}</td></tr>` : '';
+  const ks = kontakte.filter(c => c.kunde_id === a.kunde_id);
+  view.innerHTML = head(a.begegnung || 'Auftrag ohne Titel', `${datum(a.datum)}${a.uhrzeit ? ', ' + a.uhrzeit + ' Uhr' : ''} · ${kunde.name || ''}`)
+    + `<div class="toolbar"><a class="btn" href="#/auftraege">Zur Liste</a>
+      <button class="btn primary" id="aEdit">Bearbeiten</button><button class="btn" id="aDup">Duplizieren</button>
+      <select class="input" id="aStat" aria-label="Status ändern">${STATUS_AUFTRAG.map(x => `<option${x === a.status ? ' selected' : ''}>${x}</option>`).join('')}</select>
+      ${a.archiviert ? '<span class="badge warn">archiviert</span>' : ''}</div>
+    <div class="grid g2">
+      <div class="card"><h2>Auftrag</h2><table class="tbl"><tbody>
+        ${zeile('Kunde', esc(kunde.name))}${zeile('Paket', esc(byId(pakete, a.paket_id)?.name))}
+        ${zeile('Datum', datum(a.datum) + (a.uhrzeit ? ', ' + esc(a.uhrzeit) + ' Uhr' : ''))}${zeile('Ort', esc(a.ort))}${zeile('Sportart', esc(a.sportart))}
+        ${zeile('Spieler', a.spieler)}${zeile('Kilometer', a.km ? a.km + ' km einfache Strecke' : '')}
+        ${zeile('Lieferfrist', datum(a.lieferfrist))}</tbody></table>
+        ${a.notizen ? `<p class="small pre">${esc(a.notizen)}</p>` : ''}</div>
+      <div class="card"><h2>Preis</h2><table class="tbl"><tbody>
+        <tr><td>Paket</td><td class="num">${euro(a.grundpreis_cent)}</td></tr>
+        ${zusatzN ? `<tr><td>${zusatzN} Zusatzspieler zu je ${euro(a.zusatz_je_spieler_cent)}</td><td class="num">${euro(a.zusatzspieler_cent)}</td></tr>` : ''}
+        ${a.anfahrt_cent ? `<tr><td>Anfahrt: ${kmN} km zu je ${euro(a.anfahrt_cent_je_km)} (${a.anfahrt_frei_km} km frei)</td><td class="num">${euro(a.anfahrt_cent)}</td></tr>` : ''}
+        <tr><td><b>Betrag</b></td><td class="num"><b>${euro(a.betrag_cent)}</b></td></tr></tbody></table>
+        ${a.betrag_manuell ? `<p class="muted small">Von Hand festgelegt. Berechnet wären ${euro(berechnet)}.</p>` : ''}</div>
+      <div class="card"><h2>Ansprechpersonen</h2>${ks.length ? `<ul class="kontakte">${ks.map(c => `<li><b>${esc(c.name)}</b>
+        <span class="muted small">${esc(c.rolle || '')}</span><br>${[c.telefon && `<a href="tel:${esc(c.telefon)}">${esc(c.telefon)}</a>`,
+          c.email && `<a href="mailto:${esc(c.email)}">${esc(c.email)}</a>`, esc(c.instagram || '')].filter(Boolean).join(' · ')}</li>`).join('')}</ul>`
+        : '<p class="muted">Bei diesem Kunden ist noch kein Kontakt hinterlegt.</p>'}</div>
+      <div class="card"><h2>Zahlung und Bilder</h2><p class="muted small">Zahlung (Phase 3) und Galerie-Links mit Fristen (Phase 4) erscheinen hier, sobald sie gebaut sind.</p></div>
+    </div>`;
+  const d = { auftraege, kunden, pakete };
+  $('#aEdit').addEventListener('click', () => auftragDialog(a, d, { danach: (was) => { if (was === 'del') location.hash = '#/auftraege'; else router(); } }));
+  // Kopie ohne Datum, Status und Betrag: die Preise kommen neu aus dem Paket
+  $('#aDup').addEventListener('click', () => auftragDialog(
+    Object.fromEntries(['kunde_id', 'paket_id', 'uhrzeit', 'begegnung', 'ort', 'sportart', 'spieler', 'km', 'notizen'].map(k => [k, a[k]])), d,
+    { titel: 'Auftrag duplizieren', danach: (was, r) => { location.hash = '#/auftrag/' + r.id; } }));
+  $('#aStat').addEventListener('change', async (ev) => {
+    try { await api('auftraege/' + a.id, 'PUT', { status: ev.target.value }); toast('Status: ' + ev.target.value); } catch (e) { toast(e.message); }
+  });
+};
+
+/* ---------- Protokoll: wer hat wann was geändert ---------- */
+App.pages.protokoll = async (view) => {
+  const rows = await api('protokoll');
+  const details = (text) => {
+    try {
+      return Object.entries(JSON.parse(text)).map(([k, v]) => Array.isArray(v) ? `${k}: ${v[0] ?? ''} → ${v[1] ?? ''}` : `${k}: ${v}`).join(', ');
+    } catch (e) { return text || ''; }
+  };
+  view.innerHTML = head('Protokoll', 'Die letzten 300 Einträge: Anmeldungen und jede Änderung')
+    + `<div class="card"><table class="tbl karten proto"><thead><tr><th>Zeit</th><th>Aktion</th><th>Eintrag</th><th>Einzelheiten</th></tr></thead><tbody>`
+    + rows.map(r => `<tr><td class="k-datum nowrap">${datum(r.time)} ${esc((r.time || '').slice(11, 16))}</td>
+      <td class="k-titel"><b>${esc(r.action)}</b> <span class="muted small">${esc(r.user_name)}</span></td>
+      <td class="k-kunde">${esc([r.table_name, r.label].filter(Boolean).join(': '))}</td>
+      <td class="k-rest small">${esc(details(r.details))}</td></tr>`).join('')
+    + '</tbody></table></div>';
+};
+
 /* ---------- Einstellungen: Pakete und Werte ---------- */
 App.pages.einstellungen = async (view) => {
-  const [pakete, s] = await Promise.all([api('pakete'), api('einstellungen')]);
+  const [pakete, s, sich] = await Promise.all([api('pakete'), api('einstellungen'), api('sicherungen')]);
   const paketFelder = [
     { key: 'name', label: 'Name', required: true, full: true },
     { key: 'grundpreis_cent', label: 'Grundpreis in Euro', type: 'euro', required: true },
@@ -264,7 +325,15 @@ App.pages.einstellungen = async (view) => {
         </tbody></table><button type="button" class="btn sm" id="pNeu">Paket hinzufügen</button></div>
       <div class="card"><h2>Werte</h2><form id="werteForm">${werte.map(f => fieldHtml(f, s[f.key])).join('')}
         <button class="btn primary">Speichern</button></form></div>
+      <div class="card"><h2>Sicherung</h2>
+        <p>${sich.length ? `Letzte Sicherung: <b>${datum(sich[0].zeit)}, ${esc(sich[0].zeit.slice(11, 16))} Uhr</b> (${sich.length} vorhanden)` : 'Noch keine Sicherung vorhanden.'}</p>
+        <p class="muted small">Jede Nacht entsteht automatisch eine Kopie der Datenbank im Ordner data/backups. Behalten werden 14 Tagesstände und 6 Monatsstände.
+          Die Kopien liegen auf demselben Rechner wie das Tool, die Ablage außerhalb folgt in Phase 6.</p>
+        <button type="button" class="btn sm" id="sichNeu">Jetzt sichern</button></div>
     </div>`;
+  $('#sichNeu').addEventListener('click', async () => {
+    try { await api('sicherungen', 'POST', {}); toast('Sicherung erstellt'); router(); } catch (e) { toast(e.message); }
+  });
   $('#pNeu').addEventListener('click', () => editRecord('pakete', 'Paket hinzufügen', paketFelder));
   $('#pListe').addEventListener('click', (ev) => {
     const id = ev.target.closest('button')?.dataset.paket;

@@ -4,6 +4,7 @@ Interne Arbeitsoberfläche für Aufträge, Zahlungen, Bildauslieferung und Vertr
 Regeln und Server: `CLAUDE.md`. Funktionsumfang und Bauphasen: `PLANUNG.md`.
 
 Stand: **Phase 2** (Kunden, Kontakte, Aufträge mit Preisberechnung, Statuswechsel, Liste mit Filtern, Pakete und Einstellungen bearbeiten).
+Dazu: Auftragsseite mit Duplizieren, Protokoll, Passwort ändern, nächtliche Sicherung.
 Davor Phase 1: Grundgerüst, Anmeldung mit Zwei-Faktor, Datenbank, Navigation.
 
 ## Lokal starten (Windows, PowerShell)
@@ -46,6 +47,16 @@ In der `.env` `STUDIO_ADMIN_PASSWORD` selbst eintragen, dann:
 ```
 docker compose -f docker-compose.lokal.yml up --build
 ```
+
+## Sicherung
+
+Solange der Server läuft, entsteht jede Nacht eine Kopie der Datenbank unter `data/backups/studio-JJJJ-MM-TT.db`.
+Behalten werden 14 Tagesstände und 6 Monatsstände. In den Einstellungen steht die letzte Sicherung, dort gibt es auch "Jetzt sichern".
+
+Wiederherstellen: Server stoppen, die gewünschte Datei aus `data/backups` als `data/studio.db` kopieren
+(vorhandene Dateien `studio.db-wal` und `studio.db-shm` löschen), Server starten.
+
+Die Kopien liegen auf demselben Rechner wie das Tool. Die Ablage außerhalb des Servers und die Sicherung der Uploads folgen in Phase 6.
 
 ## Tests
 

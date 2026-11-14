@@ -1,6 +1,7 @@
 """Tests Phase 2: Preislogik, Kunden, Kontakte, Aufträge, Einstellungen.
 Aufruf im Projektordner:  python -m unittest discover -s tests -v
 """
+import sqlite3
 import threading
 import unittest
 
@@ -196,6 +197,67 @@ class Phase2(unittest.TestCase):
             rows = [r["action"] for r in conn.execute(
                 "SELECT action FROM audit_log WHERE table_name='kunden' AND record_id=? ORDER BY id", (k["id"],))]
         self.assertEqual(rows, ["neu", "geändert", "gelöscht"])
+
+    def test_protokoll_lesbar_ohne_geheimnisse(self):
+        self.kunde("Fürs Protokoll")
+        with server.db() as conn:
+            server.secret_set(conn, "test", "geheim-xyz")
+        st, rows, _ = self.c.req("GET", "/api/protokoll")
+        self.assertEqual(st, 200)
+        self.assertEqual((rows[0]["action"], rows[0]["label"]), ("neu", "Fürs Protokoll"))
+        self.assertNotIn("geheim-xyz", str(rows))
+        self.assertNotIn("scrypt$", str(rows))
+        self.assertEqual(Client(self.port).req("GET", "/api/protokoll")[0], 401)
+
+    # ---- Passwort ändern ----
+    def test_passwort_aendern(self):
+        server.create_user("pwtest", "altes-passwort-1")
+        a, b = Client(self.port), Client(self.port)
+        self.assertEqual(a.login("pwtest", "altes-passwort-1")[0], 200)
+        self.assertEqual(b.login("pwtest", "altes-passwort-1")[0], 200)
+        self.assertEqual(a.req("POST", "/api/me/passwort", {"alt": "falsch-falsch", "neu": "neues-passwort-2"})[0], 400)
+        self.assertEqual(a.req("POST", "/api/me/passwort", {"alt": "altes-passwort-1", "neu": "kurz"})[0], 400)
+        self.assertEqual(a.req("POST", "/api/me/passwort", {"alt": "altes-passwort-1", "neu": "neues-passwort-2"})[0], 200)
+        self.assertEqual(a.req("GET", "/api/me")[0], 200)     # diese Sitzung bleibt
+        self.assertEqual(b.req("GET", "/api/me")[0], 401)     # andere Geräte sind abgemeldet
+        self.assertEqual(Client(self.port).login("pwtest", "altes-passwort-1")[0], 401)
+        self.assertEqual(Client(self.port).login("pwtest", "neues-passwort-2")[0], 200)
+
+    # ---- Sicherung ----
+    def test_sicherung_ist_eine_lesbare_datenbank(self):
+        k = self.kunde("In der Sicherung")
+        st, liste, _ = self.c.req("POST", "/api/sicherungen", {})
+        self.assertEqual(st, 200)
+        self.assertRegex(liste[0]["name"], r"^studio-\d{4}-\d{2}-\d{2}\.db$")
+        conn = sqlite3.connect(server.BACKUPS / liste[0]["name"])
+        try:
+            self.assertEqual(conn.execute("SELECT name FROM kunden WHERE id=?", (k["id"],)).fetchone()[0], "In der Sicherung")
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            conn.close()
+
+    def test_alte_sicherungen_werden_aufgeraeumt(self):
+        alt = [server.BACKUPS / f"studio-2020-{m:02d}-{t:02d}.db" for m in (1, 2, 3) for t in range(1, 21)]
+        for f in alt:
+            f.write_bytes(b"")
+        self.addCleanup(lambda: [f.unlink(missing_ok=True) for f in alt])
+        server.daily_backup()
+        da = sorted(f.name for f in server.BACKUPS.glob("studio-2020-*.db"))
+        # die Tagesstände sind neuer (heute und die letzten aus März 2020), von den Monaten bleibt jeweils der erste
+        self.assertEqual(da[:2], ["studio-2020-01-01.db", "studio-2020-02-01.db"])
+        self.assertEqual(len(da), 2 + 1 + 13)
+
+
+class Aufraeumen(unittest.TestCase):
+    def test_14_tage_und_6_monatsstaende(self):
+        namen = [f"studio-2026-{m:02d}-{t:02d}.db" for m in range(1, 11) for t in range(1, 29)]
+        keep = server.backup_behalten(namen)
+        # die 14 letzten Tage (15. bis 28. Oktober), dazu der 1. von Mai bis Oktober
+        self.assertEqual(len(keep), 14 + 6)
+        self.assertIn("studio-2026-10-15.db", keep)
+        self.assertNotIn("studio-2026-10-14.db", keep)
+        self.assertIn("studio-2026-05-01.db", keep)
+        self.assertNotIn("studio-2026-04-01.db", keep)
 
 
 if __name__ == "__main__":

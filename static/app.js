@@ -45,7 +45,7 @@ function toast(msg) {
 const TITLES = {
   start: 'Start', auftraege: 'Aufträge und Spiele', kunden: 'Kunden', zahlungen: 'Zahlungen', lieferung: 'Bildauslieferung',
   vertraege: 'Verträge und Dokumente', mail: 'Mail', kalender: 'Kalender', aufgaben: 'Aufgaben', einstellungen: 'Einstellungen',
-  sicherheit: 'Sicherheit',
+  sicherheit: 'Sicherheit', auftrag: 'Auftrag', protokoll: 'Protokoll',
 };
 const ICONS = {
   start: '<path d="M3 11l9-8 9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/>',
@@ -66,19 +66,20 @@ function renderTabbar() {
 }
 
 async function router() {
-  const name = location.hash.replace(/^#\/?/, '').split('/')[0] || 'start';
-  let page = App.pages[name] ? name : 'start';
+  const [name, ...rest] = location.hash.replace(/^#\/?/, '').split('/');
+  const page = App.pages[name] ? name : 'start';
+  const navPage = page === 'auftrag' ? 'auftraege' : page;
   // Zwei-Faktor ist Pflicht, aber noch nicht eingerichtet: nur die Seite Sicherheit
   if (App.me.must_2fa && page !== 'sicherheit') { location.hash = '#/sicherheit'; return; }
   document.body.classList.remove('nav-open');
-  $$('#nav a').forEach(a => a.classList.toggle('active', a.dataset.page === page));
-  $$('#tabbar [data-tab]').forEach(a => a.classList.toggle('active', a.dataset.tab === page));
+  $$('#nav a').forEach(a => a.classList.toggle('active', a.dataset.page === navPage));
+  $$('#tabbar [data-tab]').forEach(a => a.classList.toggle('active', a.dataset.tab === navPage));
   $('#topTitle').textContent = TITLES[page];
   document.title = TITLES[page] + ' · Studio-Tool';
   const view = $('#view');
   view.innerHTML = '<p class="muted">Lädt ...</p>';
   try {
-    await App.pages[page](view);
+    await App.pages[page](view, ...rest);
   } catch (e) {
     view.innerHTML = `<div class="card"><b>Fehler</b><p>${esc(e.message)}</p></div>`;
   }
@@ -129,7 +130,23 @@ function paketTabelle(pakete) {
 
 /* ---------- Sicherheit: Zwei-Faktor-Anmeldung (wie im Hub) ---------- */
 App.pages.sicherheit = async (view) => {
-  view.innerHTML = head('Sicherheit', 'Anmeldung mit Passwort und Code aus der App') + '<div class="card" id="tfCard"></div>';
+  view.innerHTML = head('Sicherheit', 'Anmeldung mit Passwort und Code aus der App') + '<div class="card" id="tfCard"></div>'
+    + `<div class="card" id="pwCard"><h2>Passwort ändern</h2><form id="pwForm">
+      <input type="text" autocomplete="username" value="${esc(App.me.username)}" hidden>
+      <div class="field"><label for="pw_alt">Aktuelles Passwort</label><input class="input" type="password" id="pw_alt" autocomplete="current-password" required></div>
+      <div class="field"><label for="pw_neu">Neues Passwort (mindestens 10 Zeichen)</label><input class="input" type="password" id="pw_neu" autocomplete="new-password" minlength="10" required></div>
+      <div class="field"><label for="pw_neu2">Neues Passwort wiederholen</label><input class="input" type="password" id="pw_neu2" autocomplete="new-password" minlength="10" required></div>
+      <button class="btn">Passwort ändern</button>
+      <p class="muted small">Andere Geräte werden dabei abgemeldet.</p></form></div>`;
+  $('#pwForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    if ($('#pw_neu').value !== $('#pw_neu2').value) return toast('Die neuen Passwörter stimmen nicht überein.');
+    try {
+      await api('me/passwort', 'POST', { alt: $('#pw_alt').value, neu: $('#pw_neu').value });
+      ev.target.reset();
+      toast('Passwort geändert');
+    } catch (e) { toast(e.message); }
+  });
   await twofaCard($('#tfCard'));
 };
 

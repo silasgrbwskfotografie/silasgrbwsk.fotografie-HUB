@@ -40,7 +40,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
 
-VERSION = "0.2"
+VERSION = "0.3"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -776,6 +776,67 @@ def vals_id(data):
     return v if isinstance(v, int) and not isinstance(v, bool) else 0
 
 
+# ---------------------------------------------------------------------------
+# Sicherung (wie db_snapshot und daily_backup im Hub): jede Nacht eine konsistente Kopie der Datenbank nach data/backups
+# shortcut: nur die Datenbank und nur auf derselben Platte. Uploads (ab Phase 5) und die Ablage außerhalb des Servers
+# (rclone, Phase 6) kommen dazu, bevor echte Verträge hochgeladen werden.
+# ---------------------------------------------------------------------------
+BACKUP_KEEP_TAGE = 14
+BACKUP_KEEP_MONATE = 6
+
+
+def db_snapshot(target: Path):
+    """Konsistente Kopie der Datenbank (auch während des Betriebs)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".tmp")
+    tmp.unlink(missing_ok=True)
+    with db() as src:
+        dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    os.replace(tmp, target)
+    return target
+
+
+def backup_behalten(namen):
+    """Welche Sicherungen bleiben: die letzten 14 Tagesstände, dazu der erste Stand jedes der letzten 6 Monate."""
+    namen = sorted(namen)
+    monate = {}
+    for n in namen:
+        monate.setdefault(n[7:14], n)   # studio-JJJJ-MM-TT.db -> JJJJ-MM
+    return set(namen[-BACKUP_KEEP_TAGE:]) | set(sorted(monate.values())[-BACKUP_KEEP_MONATE:])
+
+
+def daily_backup(neu=False):
+    """Sicherung von heute anlegen, falls es sie noch nicht gibt (neu=True: überschreiben), danach alte aufräumen."""
+    name = BACKUPS / f"studio-{datetime.now(TZ):%Y-%m-%d}.db"
+    if neu or not name.exists():
+        db_snapshot(name)
+    files = list(BACKUPS.glob("studio-????-??-??.db"))
+    keep = backup_behalten(f.name for f in files)
+    for f in files:
+        if f.name not in keep:
+            f.unlink(missing_ok=True)
+    return name
+
+
+def backup_loop():
+    while True:
+        try:
+            daily_backup()
+        except Exception as e:  # noqa
+            print("Sicherung fehlgeschlagen:", e)
+        threading.Event().wait(3600)
+
+
+def backup_liste():
+    files = sorted(BACKUPS.glob("studio-????-??-??.db"), reverse=True)
+    return [{"name": f.name, "groesse": f.stat().st_size,
+             "zeit": datetime.fromtimestamp(f.stat().st_mtime, TZ).isoformat(timespec="seconds")} for f in files]
+
+
 def audit_label(table, r):
     if table == "auftraege":
         return f"{datum_text(r['datum'])} {r['begegnung'] or ''}".strip()
@@ -1109,6 +1170,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "Bitte zuerst die Zwei-Faktor-Anmeldung einrichten.", "need_2fa": True}, 403)
         if method == "GET" and head == "me":
             return self.send_json({"user": user, "version": VERSION, "domain": DOMAIN})
+        if method == "POST" and p == ["me", "passwort"]:
+            return self.api_passwort(user)
+        if method == "GET" and p == ["protokoll"]:
+            with db() as conn:
+                return self.send_json([row_dict(r) for r in conn.execute(
+                    "SELECT time, user_name, action, table_name, record_id, label, details FROM audit_log ORDER BY id DESC LIMIT 300")])
+        if p == ["sicherungen"] and method in ("GET", "POST"):
+            if method == "POST":
+                name = daily_backup(neu=True)
+                with db() as conn:
+                    audit(conn, user, "Sicherung erstellt", "", None, name.name)
+            return self.send_json(backup_liste())
         if method == "POST" and p == ["auftraege", "vorschau"]:   # Preis für das Formular, speichert nichts
             data = self.read_json()
             vals = clean_values("auftraege", data)
@@ -1201,6 +1274,26 @@ class Handler(BaseHTTPRequestHandler):
                       {k: v for k, v in row_dict(old).items() if k not in AUDIT_SKIP and v not in (None, "")})
                 return self.send_json({"ok": True})
         return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+
+    # -- Eigenes Passwort ändern (/api/me/passwort) -------------------------
+    def api_passwort(self, user):
+        data = self.read_json()
+        neu = str(data.get("neu") or "")[:200]
+        with db() as conn:
+            pw_hash = conn.execute("SELECT pw_hash FROM users WHERE id=?", (user["id"],)).fetchone()["pw_hash"]
+        if not check_pw(str(data.get("alt") or "")[:200], pw_hash):
+            ip_failed(self.client_ip())
+            time.sleep(0.6)
+            return self.send_json({"error": "Das aktuelle Passwort stimmt nicht."}, 400)
+        prob = pw_problem(neu)
+        if prob:
+            raise BadRequest(prob)
+        with db() as conn:
+            conn.execute("UPDATE users SET pw_hash=? WHERE id=?", (hash_pw(neu), user["id"]))
+            # andere Geräte müssen sich neu anmelden, diese Sitzung bleibt
+            conn.execute("DELETE FROM sessions WHERE user_id=? AND token_hash != ?", (user["id"], token_hash(self.session_token())))
+            audit(conn, user, "Passwort geändert", "users", user["id"], user["username"])
+        return self.send_json({"ok": True})
 
     # -- Zwei-Faktor des eigenen Kontos (/api/me/2fa) ----------------------
     def api_twofa(self, method, p, user):
@@ -1318,6 +1411,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("adduser", "passwd", "users", "2fa-reset"):
         return cli()
     httpd = make_server()
+    threading.Thread(target=backup_loop, daemon=True).start()
     print("=" * 56)
     print(f"  {APP_NAME} {VERSION}")
     print(f"  Läuft unter http://{'127.0.0.1' if HOST in ('0.0.0.0', '::') else HOST}:{PORT}/")

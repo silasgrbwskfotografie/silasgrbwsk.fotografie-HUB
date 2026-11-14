@@ -134,3 +134,22 @@ dialog.modal::backdrop{background:rgba(10,10,10,.55)}
 .pre{white-space:pre-wrap}
 .input.sm{padding:6px 8px;font-size:14px;width:auto}
 .preisbox{background:var(--accent-soft);border-radius:9px;padding:10px 12px;margin:4px 0 8px}
+a.linkbtn{text-decoration:none}
+#pwCard{max-width:620px;margin-top:14px}
+
+/* Tabellen als Karten auf dem Handy (Auftragsliste, Protokoll) */
+@media (max-width:700px){
+  .tbl.karten thead{display:none}
+  .tbl.karten,.tbl.karten tbody{display:block}
+  .tbl.karten tr{display:grid;grid-template-columns:1fr auto;grid-template-areas:"titel betrag" "datum status" "kunde paket" "rest rest";
+    gap:4px 10px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}
+  .tbl.karten td{border:0;padding:0}
+  .tbl.karten .k-titel{grid-area:titel}
+  .tbl.karten .k-betrag{grid-area:betrag}
+  .tbl.karten .k-datum{grid-area:datum}
+  .tbl.karten .k-status{grid-area:status;justify-self:end}
+  .tbl.karten .k-kunde{grid-area:kunde;color:var(--ink-2)}
+  .tbl.karten .k-paket{grid-area:paket;justify-self:end;color:var(--ink-2)}
+  .tbl.karten .k-rest{grid-area:rest;overflow-wrap:anywhere}
+  .tbl.karten.proto tr{grid-template-areas:"titel datum" "kunde kunde" "rest rest"}
+}
