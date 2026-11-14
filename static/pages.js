@@ -574,9 +574,11 @@ App.pages.einstellungen = async (view) => {
         <button type="button" class="btn sm" id="sichNeu">Jetzt sichern</button></div>
       <div class="card" id="pushCard"></div>
       <div class="card" id="avCard"></div>
+      <div class="card" id="mkCard"></div>
     </div>`;
   pushKarte($('#pushCard'));
   vorlagenKarte($('#avCard'), pakete);
+  mailkontenKarte($('#mkCard'));
   $('#sichNeu').addEventListener('click', async () => {
     try { await api('sicherungen', 'POST', {}); toast('Sicherung erstellt'); router(); } catch (e) { toast(e.message); }
   });
@@ -721,6 +723,9 @@ App.pages.start = async (view) => {
         : `<tr><td class="nowrap">${ampelPunkt(a)}${datum(a.datum)}${a.uhrzeit ? `<br><span class="muted small">${esc(a.uhrzeit)} Uhr</span>` : ''}</td>
         <td>${auftragLink(a)}<br><span class="muted small">${esc([a.kunde, a.ort].filter(Boolean).join(' · '))}</span></td><td>${esc(a.status)}</td></tr>`, 'Keine Termine in den nächsten 14 Tagen.')}</div>
       <div class="card"><h2>Aufgaben heute und überfällig</h2><div id="startAufgaben">${aufgabenListe(d.aufgaben, true)}</div></div>
+      ${d.mails_neu.length ? `<div class="card" id="startMails"><h2>Neue Mails (${d.mails_neu.length})</h2><table class="tbl"><tbody>${d.mails_neu.map(x => `<tr>
+        <td><a class="linkbtn" href="#/mail/${x.konto_id}/m/INBOX/${x.uid}"><b>${esc(x.betreff)}</b></a><br><span class="muted small">von ${esc(pfName(x.absender))} an ${esc(x.adresse)}</span></td>
+        <td class="num"><button type="button" class="btn sm" data-mailerledigt="${x.konto_id}|${x.uid}">Erledigt</button></td></tr>`).join('')}</tbody></table></div>` : ''}
       <div class="card"><h2>Überfällige Lieferungen</h2>${liste(d.ueberfaellig, a => `<tr><td class="nowrap">${ampelPunkt(a)}${datum(a.datum)}</td>
         <td>${auftragLink(a)}<br><span class="muted small">${esc(a.kunde)}</span></td><td class="num">Frist ${datum(a.lieferfrist)}</td></tr>`, 'Nichts überfällig.')}</div>
       <div class="card"><h2>Offene Zahlungen: ${euro(d.offen_summe)}</h2>${liste(d.offen.slice(0, 6), z => `<tr><td class="nowrap">${datum(z.datum)}</td>
@@ -736,6 +741,13 @@ App.pages.start = async (view) => {
     </div>`;
   $$('.balken span', view).forEach(el => { el.style.width = Math.min(100, anteil) + '%'; });
   aufgabenBinden($('#startAufgaben'), d.aufgaben, [], []);
+  $('#startMails')?.addEventListener('click', async (ev) => {
+    const v = ev.target.closest('button')?.dataset.mailerledigt;
+    if (!v) return;
+    const [k, u] = v.split('|');
+    try { const r = await api('postfach/handled', 'POST', { konto: Number(k), folder: 'INBOX', uid: Number(u) }); toast(r.note || 'Erledigt'); badgeSync(); router(); }
+    catch (e) { toast(e.message); }
+  });
 };
 
 /* ---------- Kalender ---------- */
@@ -920,7 +932,8 @@ function aufgabenListe(liste, kurz) {
       ${x.prioritaet === 'Hoch' ? `<span class="badge ${PRIO_KLASSE.Hoch}">hoch</span>` : ''}${x.status === 'In Arbeit' ? '<span class="badge warn">in Arbeit</span>' : ''}
       ${x.wiederholung ? `<span class="muted small">(${esc(x.wiederholung)})</span>` : ''}
       <br><span class="small ${x.faellig && x.faellig < heute && x.status !== 'Erledigt' ? 'rot' : 'muted'}">${x.faellig ? 'fällig ' + datum(x.faellig) : 'ohne Datum'}</span>
-      ${!kurz && x.auftrag_id ? ` <a class="small" href="#/auftrag/${x.auftrag_id}">zum Auftrag</a>` : ''}</div></li>`).join('')}</ul>`;
+      ${!kurz && x.auftrag_id ? ` <a class="small" href="#/auftrag/${x.auftrag_id}">zum Auftrag</a>` : ''}
+      ${x.mail_verweis_id ? ` <a class="small" href="#/mail/verweis/${x.mail_verweis_id}">zur Mail</a>` : ''}</div></li>`).join('')}</ul>`;
 }
 function aufgabenBinden(box, liste, kunden, auftraege) {
   box.addEventListener('change', async (ev) => {
@@ -952,7 +965,8 @@ function aufgabeDialog(x, kunden, auftraege) {
       .map(a => [a.id, `${datum(a.datum)} ${a.begegnung || ''}`])) },
     { key: 'notizen', label: 'Notizen', type: 'textarea', full: true },
   ];
-  editRecord('aufgaben', x.id ? 'Aufgabe bearbeiten' : 'Aufgabe anlegen', felder, x, { danach: () => { badgeSync(); router(); } });
+  editRecord('aufgaben', x.id ? 'Aufgabe bearbeiten' : 'Aufgabe anlegen', felder, x,
+    { danach: () => { badgeSync(); router(); }, fix: x.mail_verweis_id ? { mail_verweis_id: x.mail_verweis_id } : {} });
 }
 
 App.pages.aufgaben = async (view) => {
@@ -1002,6 +1016,265 @@ async function vorlagenKarte(box, pakete) {
     const b = ev.target.closest('button')?.dataset || {};
     if (b.av) editRecord('aufgaben_vorlagen', 'Vorlage bearbeiten', felder, byId(vorlagen, b.av));
     if (b.avneu) editRecord('aufgaben_vorlagen', 'Vorlage hinzufügen', felder, { paket_id: Number(b.avneu), tage_offset: 0 });
+  });
+}
+
+/* ---------- Postfach (nach App.pages.postfach im Hub): mehrere Konten, live per IMAP, nur Text ---------- */
+const pfDate = d => { const x = new Date(d); if (isNaN(x)) return esc(d || '');
+  return new Date().toDateString() === x.toDateString() ? x.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })
+    : x.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit', year: '2-digit' }); };
+const pfAddr = f => { const m = String(f || '').match(/<([^>]+)>/); return (m ? m[1] : String(f || '')).trim(); };
+const pfName = f => { const m = String(f || '').match(/^\s*"?([^"<]*?)"?\s*<([^>]+)>/); return m ? (m[1].trim() || m[2]) : String(f || ''); };
+const pfEnc = s => encodeURIComponent(s);
+const pfIstErledigt = f => f.split(/[./]/).pop().trim().toLowerCase() === 'erledigt';
+
+async function refreshMailBadge() {
+  let n = 0;
+  try { n = (await api('postfach/status')).unseen || 0; } catch { return; }
+  $$('[data-mailbadge]').forEach(b => { b.textContent = n > 99 ? '99+' : n; b.classList.toggle('hidden', !n); b.title = n === 1 ? '1 ungelesene Mail' : `${n} ungelesene Mails`; });
+}
+setTimeout(refreshMailBadge, 2000);
+setInterval(() => { if (!document.hidden) refreshMailBadge(); }, 60000);
+
+App.pages.mail = async (view, ...args) => {
+  if (args[0] === 'verweis') {   // aus einer Aufgabe: die verknüpfte Mail wiederfinden
+    try {
+      const v = await api('mail_verweise/' + Number(args[1]));
+      const f = await api(`postfach/finde?konto=${v.konto_id}&verweis=${v.id}`);
+      location.replace(`#/mail/${v.konto_id}/m/${pfEnc(f.folder)}/${f.uid}`);
+    } catch (e) { view.innerHTML = head('Mail') + `<div class="card"><p>${esc(e.message)}</p></div>`; }
+    return;
+  }
+  const konten = await api('postfach/konten');
+  if (!konten.length) {
+    view.innerHTML = head('Mail') + `<div class="card"><p>Noch kein Mailkonto eingerichtet.</p><p class="muted small">Unter Einstellungen, Mailkonten ein Postfach hinterlegen
+      (Adresse, SMTP-Server, Passwort). Bei Gmail braucht es ein App-Passwort.</p><a class="btn" href="#/einstellungen">Zu den Einstellungen</a></div>`;
+    return;
+  }
+  const kid = Number(args[0]) || konten[0].id;
+  App._pf = App._pf || {};
+  const st = App._pf[kid] || (App._pf[kid] = { folder: 'INBOX', page: 0, q: '' });
+  if (args[1] === 'f' && args[2]) { st.folder = decodeURIComponent(args[2]); st.page = 0; }
+  view.innerHTML = head('Mail') + '<div class="card"><p class="muted">Postfach wird geladen ...</p></div>';
+  let info;
+  try { info = await api(`postfach/folders?konto=${kid}`); }
+  catch (e) {
+    view.innerHTML = head('Mail') + `<div class="card"><b>Postfach nicht erreichbar</b><p>${esc(e.message)}</p><a class="btn" href="#/einstellungen">Zu den Einstellungen</a></div>`;
+    return;
+  }
+  const folders = info.folders;
+  if (!folders.some(f => f.name === st.folder)) st.folder = (folders.find(f => f.role === 'inbox') || folders[0] || { name: 'INBOX' }).name;
+  const pre = `#/mail/${kid}`;
+  const boxen = info.konten.length > 1 ? `<div class="pf-boxes">${info.konten.map(k => `<a href="#/mail/${k.id}" class="${k.id === kid ? 'active' : ''}">${esc(k.adresse)}</a>`).join('')}</div>` : '';
+  view.innerHTML = `<div class="page-head pf-head"><h1>Mail<small>${esc(info.adresse)}</small></h1>
+      <div class="btn-row"><button class="btn primary" id="pfNeu">Neue Mail</button><a class="btn" href="${pre}/f/${pfEnc(st.folder)}">Aktualisieren</a></div></div>
+    <div class="pf-layout"><nav class="pf-folders" aria-label="Ordner">${boxen}${folders.map(f => `<a href="${pre}/f/${pfEnc(f.name)}" class="${f.name === st.folder ? 'active' : ''}">
+      ${esc(f.label)}${f.unseen ? ` <span class="badge bad">${f.unseen}</span>` : ''}</a>`).join('')}</nav><div id="pfMain"><div class="card"><p class="muted">Lädt ...</p></div></div></div>`;
+  const ctx = { kid, info, konten: info.konten };
+  $('#pfNeu').addEventListener('click', () => pfCompose(ctx, {}));
+  const main = $('#pfMain');
+  if (args[1] === 'm' && args[3]) return pfShow(main, ctx, decodeURIComponent(args[2]), args[3]);
+  const rolle = (folders.find(f => f.name === st.folder) || {}).role || '';
+  const schnellErledigt = !pfIstErledigt(st.folder) && !['sent', 'drafts', 'trash', 'junk'].includes(rolle);
+
+  const liste = async () => {
+    main.innerHTML = '<div class="card"><p class="muted">Lädt ...</p></div>';
+    let r;
+    try { r = await api(`postfach/messages?konto=${kid}&folder=${pfEnc(st.folder)}&page=${st.page}${st.q ? '&q=' + pfEnc(st.q) : ''}`); }
+    catch (e) { main.innerHTML = `<div class="card"><p>${esc(e.message)}</p></div>`; return; }
+    const gesendet = rolle === 'sent';
+    main.innerHTML = `<form class="toolbar" id="pfSuche"><input class="input" name="q" placeholder="Suchen (Absender, Betreff, Text)" value="${esc(st.q)}" aria-label="Mails suchen">
+        <button class="btn sm">Suchen</button>${st.q ? '<button type="button" class="btn sm" id="pfAlle">Alle zeigen</button>' : ''}
+        <span class="muted small">${r.total} Mail${r.total === 1 ? '' : 's'}</span></form>
+      <div class="card pf-list">${r.items.map(m => `<a class="pf-row ${m.seen ? '' : 'unread'}" href="${pre}/m/${pfEnc(st.folder)}/${m.uid}">
+          <span class="pf-from">${esc(pfName(gesendet ? m.to : m.from))}</span>
+          <span class="pf-subj">${m.inbox === 'neu' ? '<span class="badge bad">neu</span> ' : ''}${m.answered ? '<span class="badge plain" title="beantwortet">beantwortet</span> ' : ''}${esc(m.subject)}
+            ${m.attachment ? ' <span class="badge plain">Anhang</span>' : ''}${m.kunde ? ` <span class="badge ok">${esc(m.kunde)}</span>` : ''}</span>
+          <span class="pf-date">${pfDate(m.date)}${schnellErledigt ? `<button type="button" class="pf-done" data-done="${m.uid}" title="Erledigt: in den Ordner Erledigt verschieben" aria-label="Erledigt">✓</button>` : ''}</span></a>`).join('')
+          || '<p class="muted pf-leer">Keine Mails.</p>'}</div>
+      ${r.pages > 1 ? `<div class="btn-row">${st.page > 0 ? '<button class="btn sm" id="pfNeuer">Neuere</button>' : ''}<span class="muted small">Seite ${r.page + 1} von ${r.pages}</span>
+        ${st.page < r.pages - 1 ? '<button class="btn sm" id="pfAelter">Ältere</button>' : ''}</div>` : ''}`;
+    $('#pfSuche').addEventListener('submit', (ev) => { ev.preventDefault(); st.q = ev.target.elements.q.value.trim(); st.page = 0; liste(); });
+    $('#pfAlle')?.addEventListener('click', () => { st.q = ''; st.page = 0; liste(); });
+    $('#pfNeuer')?.addEventListener('click', () => { st.page--; liste(); });
+    $('#pfAelter')?.addEventListener('click', () => { st.page++; liste(); });
+    $$('[data-done]', main).forEach(b => b.addEventListener('click', async (ev) => {
+      ev.preventDefault(); ev.stopPropagation(); b.disabled = true;
+      try { const x = await api('postfach/handled', 'POST', { konto: kid, folder: st.folder, uid: Number(b.dataset.done) }); toast(x.note || 'Erledigt'); badgeSync(); liste(); }
+      catch (e) { toast(e.message); b.disabled = false; }
+    }));
+  };
+  liste();
+  refreshMailBadge();
+};
+
+async function pfShow(main, ctx, folder, uid) {
+  let m;
+  try { m = await api(`postfach/message?konto=${ctx.kid}&folder=${pfEnc(folder)}&uid=${Number(uid)}`); }
+  catch (e) { main.innerHTML = `<div class="card"><p>${esc(e.message)}</p></div>`; return; }
+  const zurueck = `#/mail/${ctx.kid}/f/${pfEnc(folder)}`;
+  main.innerHTML = `<div class="card pf-msg">
+      <div class="btn-row pf-knoepfe"><a class="btn sm" href="${zurueck}">Zurück</a>
+        <button class="btn sm primary" id="pmAntw">Antworten</button><button class="btn sm" id="pmAlle">Allen antworten</button><button class="btn sm" id="pmWeiter">Weiterleiten</button>
+        ${pfIstErledigt(folder) ? '' : '<button class="btn sm" id="pmErledigt" title="In den Ordner Erledigt verschieben">Erledigt</button>'}
+        <button class="btn sm" id="pmUngelesen">Als ungelesen</button><button class="btn sm danger" id="pmLoeschen">Löschen</button></div>
+      <div class="pf-tasks">
+        ${m.kunde ? `<span class="badge ok">Kunde: ${esc(m.kunde.kunde)}</span><span class="small muted">über ${esc(m.kunde.kontakt)}</span>` : ''}
+        ${m.verweise.map(v => `<span class="badge plain">verknüpft: ${v.auftrag_id ? `<a href="#/auftrag/${v.auftrag_id}">${datum(v.datum)} ${esc(v.begegnung || 'Auftrag')}</a>` : esc(v.kunde || '')}</span>`).join('')}
+        ${m.inbox ? (m.inbox.status === 'neu' ? '<span class="badge bad">Neu, noch nicht erledigt</span>' : `<span class="badge ok">Erledigt</span><span class="small muted">${esc(m.inbox.aktion || '')}</span>`) : ''}
+      </div>
+      <div class="btn-row pf-aus"><span class="muted small">Daraus machen:</span><button class="btn sm" id="pmAuftrag">Auftrag</button><button class="btn sm" id="pmTermin">Termin</button>
+        <button class="btn sm" id="pmAufgabe">Aufgabe</button><button class="btn sm" id="pmVerknuepfen">Mit Kunde oder Auftrag verknüpfen</button></div>
+      <h2 class="pf-betreff">${esc(m.subject)}</h2>
+      <div class="small"><b>Von:</b> ${esc(m.from)}</div>
+      <div class="small"><b>An:</b> ${esc(m.to)}${m.cc ? ` <b>Cc:</b> ${esc(m.cc)}` : ''}</div>
+      <div class="small muted">${esc(isNaN(new Date(m.date)) ? m.date : new Date(m.date).toLocaleString('de-DE'))}${m.answered ? ' · beantwortet' : ''}</div>
+      ${m.attachments.length ? `<div class="pf-att">${m.attachments.map(a => `<a class="btn sm" href="/api/postfach/attachment?konto=${ctx.kid}&folder=${pfEnc(folder)}&uid=${m.uid}&i=${a.i}">${esc(a.name)} <span class="muted">${groesse(a.size)}</span></a>`).join('')}</div>` : ''}
+      <pre class="pf-text">${esc(m.text || '(kein Text)')}</pre></div>`;
+  refreshMailBadge();
+  const zitat = () => ({ head: `Am ${isNaN(new Date(m.date)) ? m.date : new Date(m.date).toLocaleString('de-DE')} schrieb ${m.from}:`, text: m.text || '' });
+  const re = s => /^(re|aw):/i.test(s) ? s : 'Re: ' + s;
+  const ich = ctx.konten.map(k => k.adresse.toLowerCase());
+  const basis = { reply: { folder, uid: m.uid }, name: pfName(m.reply_to || m.from) };
+  $('#pmAntw').addEventListener('click', () => pfCompose(ctx, { ...basis, to: pfAddr(m.reply_to || m.from), subject: re(m.subject), quote: zitat() }));
+  $('#pmAlle').addEventListener('click', () => {
+    const andere = [m.to, m.cc].join(',').split(',').map(pfAddr).filter(a => a && a.includes('@') && !ich.includes(a.toLowerCase()));
+    pfCompose(ctx, { ...basis, to: pfAddr(m.reply_to || m.from), cc: [...new Set(andere)].join(', '), subject: re(m.subject), quote: zitat() });
+  });
+  $('#pmWeiter').addEventListener('click', () => pfCompose(ctx, { subject: /^(fwd|wg):/i.test(m.subject) ? m.subject : 'WG: ' + m.subject, source: { folder, uid: m.uid },
+    quote: { head: `---------- Weitergeleitete Nachricht ----------\nVon: ${m.from}\nDatum: ${m.date}\nBetreff: ${m.subject}\nAn: ${m.to}`, text: m.text || '', forward: true },
+    note: m.attachments.length ? 'Anhänge werden nicht mit weitergeleitet. Bei Bedarf herunterladen und selbst anhängen.' : '' }));
+  $('#pmErledigt')?.addEventListener('click', async () => {
+    try { const r = await api('postfach/handled', 'POST', { konto: ctx.kid, folder, uid: m.uid }); toast(r.note || 'Erledigt und in den Ordner Erledigt verschoben'); badgeSync(); location.hash = zurueck; }
+    catch (e) { toast(e.message); }
+  });
+  $('#pmUngelesen').addEventListener('click', async () => { await api('postfach/flag', 'POST', { konto: ctx.kid, folder, uid: m.uid, flag: 'seen', value: false }); toast('Als ungelesen markiert'); location.hash = zurueck; });
+  $('#pmLoeschen').addEventListener('click', async () => {
+    if (!confirm('Diese Mail löschen? Sie kommt in den Papierkorb, im Papierkorb selbst wird sie endgültig gelöscht.')) return;
+    try { const r = await api('postfach/delete', 'POST', { konto: ctx.kid, folder, uid: m.uid }); toast(r.action === 'endgültig gelöscht' ? 'Endgültig gelöscht' : 'In den Papierkorb verschoben'); location.hash = zurueck; }
+    catch (e) { toast(e.message); }
+  });
+  // Aus der Mail etwas anlegen: der Verweis merkt sich nur Konto, Ordner und Message-ID, die Mail bleibt im Postfach
+  const verweis = (extra = {}) => api('postfach/verweis', 'POST', { konto: ctx.kid, folder, message_id: m.message_id, betreff: m.subject, absender: m.from, ...extra });
+  const notiz = `Aus Mail von ${m.from}, ${m.subject}`;
+  $('#pmAuftrag').addEventListener('click', async () => {
+    const [kunden, pakete, auftraege] = await Promise.all([api('kunden'), api('pakete'), api('auftraege')]);
+    auftragDialog({ kunde_id: m.kunde?.kunde_id, begegnung: m.subject.replace(/^(re|aw|wg|fwd):\s*/i, ''), notizen: notiz }, { kunden, pakete, auftraege },
+      { danach: async (was, r) => { if (m.message_id) await verweis({ auftrag_id: r.id, kunde_id: r.kunde_id }).catch(() => {}); location.hash = '#/auftrag/' + r.id; } });
+  });
+  $('#pmTermin').addEventListener('click', async () => terminDialog({ titel: m.subject.replace(/^(re|aw|wg|fwd):\s*/i, ''), beginn: isoTag(new Date()), kunde_id: m.kunde?.kunde_id, notizen: notiz },
+    await api('kunden'), () => toast('Termin angelegt')));
+  $('#pmAufgabe').addEventListener('click', async () => {
+    try {
+      const v = m.message_id ? await verweis({ kunde_id: m.kunde?.kunde_id }) : null;
+      const [kunden, auftraege] = await Promise.all([api('kunden'), api('auftraege')]);
+      aufgabeDialog({ titel: 'Mail beantworten: ' + m.subject, faellig: isoTag(new Date()), kunde_id: m.kunde?.kunde_id, mail_verweis_id: v?.id }, kunden, auftraege);
+    } catch (e) { toast(e.message); }
+  });
+  $('#pmVerknuepfen').addEventListener('click', async () => {
+    if (!m.message_id) return toast('Diese Mail hat keine Message-ID und lässt sich nicht verknüpfen.');
+    const [kunden, auftraege] = await Promise.all([api('kunden'), api('auftraege')]);
+    const felder = [
+      { key: 'kunde_id', label: 'Kunde', type: 'select', options: [['', 'ohne']].concat(kunden.filter(k => !k.archiviert).map(k => [k.id, k.name])) },
+      { key: 'auftrag_id', label: 'Auftrag', type: 'select', options: [['', 'ohne']].concat(auftraege.filter(a => !a.archiviert).slice(-200).map(a => [a.id, `${datum(a.datum)} ${a.begegnung || ''}`])) },
+    ];
+    editRecord('postfach/verweis', 'Mail verknüpfen', felder, { kunde_id: m.kunde?.kunde_id },
+      { fix: { konto: ctx.kid, folder, message_id: m.message_id, betreff: m.subject, absender: m.from }, danach: () => pfShow(main, ctx, folder, uid) });
+  });
+}
+
+async function pfCompose(ctx, d) {
+  const dlg = $('#modal');
+  const vorlagen = await api('vorlagen').catch(() => []);
+  const q = d.quote || null;
+  dlg.innerHTML = `<form class="modal-box" id="pcForm"><h2>${d.reply ? 'Antworten' : d.source ? 'Weiterleiten' : 'Neue Mail'}</h2>
+    ${ctx.konten.length > 1 ? `<div class="field"><label for="pc_von">Absender</label><select class="input" id="pc_von">${ctx.konten.map(k => `<option value="${k.id}"${k.id === ctx.kid ? ' selected' : ''}>${esc(k.adresse)}</option>`).join('')}</select></div>`
+      : `<p class="muted small">Absender: <b>${esc(ctx.info.adresse)}</b></p>`}
+    <div class="field"><label for="pc_to">An</label><input class="input" id="pc_to" value="${esc(d.to || '')}" placeholder="name@beispiel.de, mehrere mit Komma" required></div>
+    <div class="field"><label for="pc_cc">Cc (optional)</label><input class="input" id="pc_cc" value="${esc(d.cc || '')}"></div>
+    <div class="field"><label for="pc_subj">Betreff</label><input class="input" id="pc_subj" value="${esc(d.subject || '')}" maxlength="250" required></div>
+    ${vorlagen.length ? `<div class="field"><label for="pc_vorlage">Textvorlage einfügen</label><select class="input" id="pc_vorlage"><option value="">keine</option>
+      ${vorlagen.map(v => `<option value="${v.id}">${esc(v.name)}</option>`).join('')}</select></div>` : ''}
+    <div class="field"><label for="pc_body">Text</label><textarea class="input" id="pc_body" rows="10">${esc(d.body || '')}</textarea>
+      ${d.note ? `<small class="muted">${esc(d.note)}</small>` : ''}</div>
+    ${ctx.info.signatur ? `<div class="field"><label class="check"><input type="checkbox" id="pc_sig" checked> Signatur anhängen</label><pre class="pf-sig" id="pc_sigtext">${esc(ctx.info.signatur)}</pre></div>` : ''}
+    ${q ? `<details><summary class="small">${q.forward ? 'Weitergeleitete Nachricht' : 'Ursprüngliche Nachricht'} (wird angehängt)</summary><pre class="pf-text pf-zitat">${esc(q.head + '\n' + q.text)}</pre></details>` : ''}
+    <p class="muted small">Die Mail landet zusätzlich im Ordner Gesendet des Kontos, über das sie verschickt wird.</p>
+    <div class="modal-foot"><span></span><span class="btn-row"><button type="button" class="btn" id="pcZu">Abbrechen</button><button class="btn primary" id="pcSend">Senden</button></span></div></form>`;
+  dlg.showModal();
+  $('#pc_body').focus();
+  $('#pcZu').addEventListener('click', () => dlg.close());
+  $('#pc_sig')?.addEventListener('change', (e) => $('#pc_sigtext').classList.toggle('hidden', !e.target.checked));
+  $('#pc_vorlage')?.addEventListener('change', (e) => {
+    const v = byId(vorlagen, e.target.value);
+    if (!v) return;
+    const t = v.text.replace(/\{name\}/g, d.name || '');
+    const b = $('#pc_body');
+    b.value = b.value ? b.value.replace(/\s*$/, '') + '\n\n' + t : t;
+  });
+  $('#pcForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const btn = $('#pcSend'); btn.disabled = true; btn.textContent = 'Wird gesendet ...';
+    try {
+      const r = await api('postfach/send', 'POST', { konto: ctx.kid, von: $('#pc_von') ? Number($('#pc_von').value) : ctx.kid, to: $('#pc_to').value, cc: $('#pc_cc').value,
+        subject: $('#pc_subj').value, body: $('#pc_body').value, quote: q, signature: $('#pc_sig') ? $('#pc_sig').checked : false, reply: d.reply || null, source: d.source || null });
+      dlg.close(); toast(r.note || 'Mail gesendet'); badgeSync();
+      if (d.reply || d.source) router();
+    } catch (e) { toast(e.message); btn.disabled = false; btn.textContent = 'Senden'; }
+  });
+}
+
+/* ---------- Einstellungen: Mailkonten ---------- */
+async function mailkontenKarte(box) {
+  const konten = await api('mailkonten');
+  const felder = [
+    { key: 'name', label: 'Name (zum Beispiel Studio oder Privat)' },
+    { key: 'adresse', label: 'E-Mail-Adresse', type: 'email', required: true },
+    { key: 'absender_name', label: 'Name im Absender (optional)' },
+    { key: 'smtp_host', label: 'SMTP-Server (zum Beispiel smtp.gmail.com)', required: true },
+    { key: 'smtp_port', label: 'SMTP-Port (465 oder 587)', type: 'number', def: 465 },
+    { key: 'imap_host', label: 'IMAP-Server (leer: aus dem SMTP-Server, smtp. wird imap.)' },
+    { key: 'imap_port', label: 'IMAP-Port', type: 'number', def: 993 },
+    { key: 'benutzer', label: 'Benutzername (leer: die Adresse)' },
+    { key: 'signatur', label: 'Signatur', type: 'textarea', full: true },
+    { key: 'aktiv', label: 'Aktiv (im Postfach zeigen und abrufen)', type: 'check', def: 1 },
+    { key: 'sort', label: 'Reihenfolge', type: 'number' },
+  ];
+  box.innerHTML = `<h2>Mailkonten</h2>
+    <p class="muted small">Postfächer für die Seite Mail. Das Passwort wird geschützt gespeichert und nie wieder angezeigt.
+      Gmail: ein App-Passwort verwenden (Google-Konto, Sicherheit, Bestätigung in zwei Schritten, App-Passwörter).</p>
+    ${konten.length ? `<ul class="kontakte">${konten.map(k => `<li><button type="button" class="linkbtn" data-mk="${k.id}"><b>${esc(k.adresse)}</b></button>
+      ${k.aktiv ? '' : '<span class="badge plain">aus</span>'} ${k.passwort_gesetzt ? '' : '<span class="badge bad">Passwort fehlt</span>'}
+      <br><span class="muted small">${esc(k.smtp_host)}${k.smtp_port ? ':' + esc(k.smtp_port) : ''}</span>
+      <div class="btn-row"><button type="button" class="btn sm" data-mkpw="${k.id}">Passwort setzen</button><button type="button" class="btn sm" data-mkcheck="${k.id}">Verbindung prüfen</button></div></li>`).join('')}</ul>`
+      : '<p class="muted">Noch kein Mailkonto.</p>'}
+    <button type="button" class="btn sm" id="mkNeu">Mailkonto hinzufügen</button>`;
+  $('#mkNeu', box).addEventListener('click', () => editRecord('mailkonten', 'Mailkonto hinzufügen', felder, {}));
+  box.addEventListener('click', async (ev) => {
+    const b = ev.target.closest('button')?.dataset || {};
+    if (b.mk) editRecord('mailkonten', 'Mailkonto bearbeiten', felder, byId(konten, b.mk));
+    if (b.mkpw) {
+      const dlg = $('#modal');
+      dlg.innerHTML = `<form class="modal-box" id="mkPwForm"><h2>Passwort für ${esc(byId(konten, b.mkpw).adresse)}</h2>
+        <input type="text" autocomplete="username" value="${esc(byId(konten, b.mkpw).adresse)}" hidden>
+        <div class="field"><label for="mk_pw">Passwort (bei Gmail das App-Passwort)</label><input class="input" type="password" id="mk_pw" autocomplete="new-password" required></div>
+        <div class="modal-foot"><span></span><span class="btn-row"><button type="button" class="btn" id="mkPwZu">Abbrechen</button><button class="btn primary">Speichern</button></span></div></form>`;
+      dlg.showModal();
+      $('#mkPwZu').addEventListener('click', () => dlg.close());
+      $('#mkPwForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        try { await api(`mailkonten/${b.mkpw}/passwort`, 'PUT', { passwort: $('#mk_pw').value }); dlg.close(); toast('Passwort gespeichert'); router(); }
+        catch (err) { toast(err.message); }
+      });
+    }
+    if (b.mkcheck) {
+      ev.target.disabled = true; ev.target.textContent = 'Prüfe ...';
+      try {
+        const r = await api(`mailkonten/${b.mkcheck}/pruefen`, 'POST', {});
+        alert(`Versand (SMTP): ${r.smtp === 'ok' ? 'in Ordnung' : r.smtp}\nEmpfang (IMAP): ${r.imap === 'ok' ? 'in Ordnung' : r.imap}`);
+      } catch (e) { toast(e.message); }
+      ev.target.disabled = false; ev.target.textContent = 'Verbindung prüfen';
+    }
   });
 }
 

@@ -214,6 +214,7 @@ Regeln für die Umsetzung:
 - Phase 6: Kalender als eigene einfache Ansicht statt FullCalendar (keine fremde Bibliothek nötig). Kalender-Abo über einen geheimen Link, gespeichert wird nur sein Hash, er wird nur beim Erstellen angezeigt. Deployment auf den VPS macht Silas nach der Anleitung im README.
 - Phase 7: Web Push aus dem Hub übernommen (webpush.py, geprüft mit dem Beispiel aus RFC 8291). Push nur an bekannte Push-Dienste, Schlüssel in secrets. App-Symbole aus icon.svg gezeichnet.
 - Phase 8: Aufgaben-Vorlagen je Paket mit Tagen relativ zum Auftrag (Vorschlag: Akkus laden 1 Tag vorher, Bilder sichern am Tag, Auswahl 1 Tag danach, Galerie und Link 3 Tage danach, Zahlung prüfen 7 Tage danach), in den Einstellungen änderbar. Wiederkehrende Aufgaben: die nächste entsteht beim Erledigen. Erinnerung an Aufgaben am Fälligkeitstag um 8 Uhr, an Termine mit wählbarem Vorlauf. Fremder Kalender nur zur Anzeige, nie im eigenen Abo; Wiederholungen dort nur mit FREQ, INTERVAL, COUNT, UNTIL.
+- Phase 9: Postfach aus dem Hub (postfach.py). Ohne Zuweisen, Rechte, Gruppen und Kontaktformular, weil nur Silas das Tool nutzt (Annahme aus der Planung, noch nicht ausdrücklich bestätigt). Signatur als Text je Mailkonto, Logo und Farben offen. Tests gegen einen nachgebauten IMAP- und SMTP-Server (tests/fake_mail.py); die Fähigkeiten der echten Anbieter (MOVE, UIDPLUS, SPECIAL-USE, Namespace, Gmail-Labels) sind noch nicht geprüft.
 
 ## Technik und Architektur
 

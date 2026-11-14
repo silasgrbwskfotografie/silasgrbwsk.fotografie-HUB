@@ -29,6 +29,7 @@ import ipaddress
 import getpass
 import hashlib
 import hmac
+import html as htmlmod
 import json
 import mimetypes
 import os
@@ -47,10 +48,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from zoneinfo import ZoneInfo
 
+import postfach as pfm
 import webpush
+from postfach import PostfachError, imap_quote, pf_head, pf_name
 from webpush import b64u, b64u_dec, ec_pub_point, push_endpoint_ok
 
-VERSION = "0.9"
+VERSION = "0.10"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -206,7 +209,9 @@ TABLES = {
         "smtp_port": "INTEGER DEFAULT 465",
         "imap_host": "TEXT",
         "imap_port": "INTEGER DEFAULT 993",
-        "benutzer": "TEXT",
+        "benutzer": "TEXT",                              # leer: die Adresse
+        "absender_name": "TEXT",                         # Name im Absender, zum Beispiel silasgrbwsk.fotografie
+        "smtp_security": "TEXT DEFAULT ''",              # leer: aus dem Port (465 SSL, 587 STARTTLS)
         "signatur": "TEXT",
         "aktiv": "INTEGER DEFAULT 1",
         "sort": "INTEGER DEFAULT 0",
@@ -219,6 +224,7 @@ TABLES = {
         "betreff": "TEXT",
         "absender": "TEXT",
         "status": "TEXT DEFAULT 'neu'",                  # neu / erledigt
+        "aktion": "TEXT",                                # beantwortet, gelöscht, erledigt, ...
         "erkannt_am": "TEXT",
         "erledigt_am": "TEXT",
     },
@@ -289,6 +295,7 @@ INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_kontakte_kunde ON kontakte(kunde_id)",
     "CREATE INDEX IF NOT EXISTS ix_vertraege_kunde ON vertraege(kunde_id)",
     "CREATE INDEX IF NOT EXISTS ix_mail_eingang_konto ON mail_eingang(konto_id, uid)",
+    "CREATE INDEX IF NOT EXISTS ix_mail_verweise_mid ON mail_verweise(message_id)",
     "CREATE INDEX IF NOT EXISTS ix_termine_beginn ON termine(beginn)",
     "CREATE INDEX IF NOT EXISTS ix_aufgaben_faellig ON aufgaben(faellig)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_push_endpoint ON push_abos(endpoint)",
@@ -726,13 +733,13 @@ def twofa_reset(username):
 # Phase 2: Kunden, Kontakte, Pakete, Aufträge (allgemeine Tabellen-Schnittstelle wie api_table im Hub)
 # ---------------------------------------------------------------------------
 API_TABLES = ("kunden", "kontakte", "pakete", "auftraege", "zahlungen", "lieferlinks", "vorlagen", "vertraege", "dokumente",
-              "termine", "aufgaben", "aufgaben_vorlagen")
+              "termine", "aufgaben", "aufgaben_vorlagen", "mailkonten", "mail_verweise")
 ORDER = {"kunden": "name COLLATE NOCASE, id", "kontakte": "name COLLATE NOCASE, id", "pakete": "sort, id",
          "auftraege": "datum, uhrzeit, id", "zahlungen": "auftrag_id, art = 'Zahlung', id",
          "lieferlinks": "auftrag_id, erstellt_am, id", "vorlagen": "sort, id", "vertraege": "beginn, id",
          "dokumente": "hochgeladen_am DESC, id", "termine": "beginn, id",
          "aufgaben": "status = 'Erledigt', faellig = '', faellig IS NULL, faellig, prioritaet = 'Niedrig', prioritaet = 'Mittel', sort, id",
-         "aufgaben_vorlagen": "paket_id, sort, id"}
+         "aufgaben_vorlagen": "paket_id, sort, id", "mailkonten": "sort, id", "mail_verweise": "erstellt_am DESC, id"}
 # Diese Felder setzt nur der Server (Preise, Fristen, Zeitstempel)
 SERVER_FIELDS = {
     "kunden": ("erstellt_am", "geaendert_am"),
@@ -743,6 +750,7 @@ SERVER_FIELDS = {
     "dokumente": ("hochgeladen_am", "datei", "datei_name", "groesse"),
     "aufgaben": ("erstellt_am", "geaendert_am", "erledigt_am"),
     "termine": ("erstellt_am", "geaendert_am"),
+    "mail_verweise": ("erstellt_am",),
     "auftraege": ("erstellt_am", "geaendert_am", "serie", "grundpreis_cent", "inkl_spieler", "zusatz_je_spieler_cent",
                   "anfahrt_frei_km", "anfahrt_cent_je_km", "zusatzspieler_cent", "anfahrt_cent", "lieferfrist"),
 }
@@ -863,6 +871,20 @@ def check_row(conn, table, row):
             raise BadRequest("Unbekannte Einheit der Kündigungsfrist.")
     if table == "dokumente" and (not row.get("kunde_id") or not row.get("titel")):
         raise BadRequest("Bitte Kunde und Titel eingeben.")
+    if table == "mailkonten":
+        if not re.fullmatch(r"[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+", row.get("adresse") or ""):
+            raise BadRequest("Bitte eine gültige E-Mail-Adresse eingeben.")
+        if not re.fullmatch(r"[A-Za-z0-9.-]{3,200}", row.get("smtp_host") or ""):
+            raise BadRequest("Bitte den SMTP-Server eingeben, zum Beispiel smtp.gmail.com.")
+        if row.get("imap_host") and not re.fullmatch(r"[A-Za-z0-9.-]{3,200}", row["imap_host"]):
+            raise BadRequest("Der IMAP-Server darf nur Buchstaben, Zahlen, Punkt und Bindestrich enthalten.")
+        for k in ("smtp_port", "imap_port"):
+            if row.get(k) is not None and not 1 <= int(row[k]) <= 65535:
+                raise BadRequest("Ungültiger Port.")
+        if (row.get("smtp_security") or "") not in ("", "ssl", "starttls"):
+            raise BadRequest("Unbekannte Verschlüsselung.")
+    if table == "mail_verweise" and (not row.get("konto_id") or not row.get("message_id")):
+        raise BadRequest("Der Verweis braucht Konto und Message-ID.")
     if table in ("aufgaben", "aufgaben_vorlagen") and not row.get("titel"):
         raise BadRequest("Bitte einen Titel eingeben.")
     if table in ("aufgaben", "aufgaben_vorlagen") and (row.get("prioritaet") or "Mittel") not in PRIORITAETEN:
@@ -1323,6 +1345,162 @@ def backup_liste():
              "zeit": datetime.fromtimestamp(f.stat().st_mtime, TZ).isoformat(timespec="seconds")} for f in files]
 
 
+# ---------------------------------------------------------------------------
+# Postfach (Phase 9): mehrere Mailkonten, live per IMAP, wie im Hub. Passwort je Konto in secrets ("mailkonto:<id>").
+# ---------------------------------------------------------------------------
+PF_POLL_SEKUNDEN = 120
+
+
+def konto_cfg(conn, kid):
+    """Zugangsdaten eines Mailkontos für postfach.py. Fehlt etwas, meldet postfach_open das verständlich."""
+    k = conn.execute("SELECT * FROM mailkonten WHERE id=?", (kid,)).fetchone()
+    if not k:
+        raise BadRequest("Dieses Mailkonto gibt es nicht.")
+    imap = (k["imap_host"] or "").strip() or re.sub(r"^smtp\.", "imap.", (k["smtp_host"] or "").strip())
+    port = k["smtp_port"] or 465
+    sicherheit = k["smtp_security"] or {465: "ssl", 587: "starttls"}.get(port, "starttls")
+    from email.utils import formataddr
+    return {"id": k["id"], "name": k["name"] or k["adresse"], "adresse": k["adresse"], "signatur": k["signatur"] or "",
+            "imap": imap if re.fullmatch(r"[A-Za-z0-9.-]{3,200}", imap or "") else "", "imap_port": k["imap_port"] or 993,
+            "smtp_host": k["smtp_host"] or "", "smtp_port": port, "smtp_security": sicherheit,
+            "smtp_user": (k["benutzer"] or k["adresse"] or "").strip(), "smtp_password": secret_get(conn, f"mailkonto:{k['id']}"),
+            "smtp_from": formataddr((k["absender_name"], k["adresse"])) if k["absender_name"] else k["adresse"]}
+
+
+def aktive_konten(conn):
+    return [konto_cfg(conn, r["id"]) for r in conn.execute("SELECT id FROM mailkonten WHERE IFNULL(aktiv, 1)=1 ORDER BY sort, id")]
+
+
+def pf_mark_handled(kid, uid, aktion):
+    """Neue Mail als erledigt markieren; die Push-Meldung auf den Geräten wird ersetzt und schließt sich."""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM mail_eingang WHERE konto_id=? AND uid=? AND status='neu'", (kid, int(uid))).fetchone()
+        if not row:
+            return False
+        conn.execute("UPDATE mail_eingang SET status='erledigt', aktion=?, erledigt_am=? WHERE id=?", (aktion, now_iso(), row["id"]))
+    send_push_async(f"Erledigt: {row['betreff'][:80]}", f"Die Mail wurde {aktion}.", "/#/mail", f"mail-{row['id']}", "done")
+    return True
+
+
+def pf_poll(cfg):
+    """Neue ungelesene Mails im Posteingang eines Kontos melden (wie pf_poll im Hub). Erster Lauf: nur den Stand merken."""
+    from email import policy
+    from email.parser import BytesHeaderParser
+    kid = cfg["id"]
+    m = pfm.postfach_open(cfg)[0]
+    neu, fertig = [], []
+    try:
+        m.select("INBOX", readonly=True)
+        uv = (m.untagged_responses.get("UIDVALIDITY") or [b""])[0]
+        uv = uv.decode() if isinstance(uv, bytes) else str(uv)
+        with db() as conn:
+            last = int(secret_get(conn, f"pf:{kid}:last_uid") or 0)
+            known_uv = secret_get(conn, f"pf:{kid}:uidvalidity") or ""
+        typ, data = m.uid("SEARCH", None, "ALL")
+        uids = [int(x) for x in (data[0] or b"").split()]
+        if not known_uv or known_uv != uv:   # erster Lauf oder Postfach neu aufgebaut: nichts Altes melden
+            with db() as conn:
+                secret_set(conn, f"pf:{kid}:uidvalidity", uv)
+                secret_set(conn, f"pf:{kid}:last_uid", str(max(uids or [0])))
+            return 0
+        frisch = [u for u in uids if u > last]
+        if frisch:
+            typ, data = m.uid("FETCH", ",".join(map(str, frisch[-50:])), "(UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT MESSAGE-ID)])")
+            for x in data or []:
+                if not isinstance(x, tuple):
+                    continue
+                um = re.search(rb"UID (\d+)", x[0])
+                if not um or b"\\Seen" in x[0]:
+                    continue
+                h = BytesHeaderParser(policy=policy.compat32).parsebytes(x[1])
+                neu.append((int(um.group(1)), pf_head(h.get("Subject")) or "(ohne Betreff)", pf_head(h.get("From")), (h.get("Message-ID") or "")[:300]))
+            with db() as conn:
+                secret_set(conn, f"pf:{kid}:last_uid", str(max(frisch)))
+        with db() as conn:
+            offen = conn.execute("SELECT * FROM mail_eingang WHERE konto_id=? AND status='neu' AND uidvalidity=?", (kid, int(uv or 0))).fetchall()
+        if offen:   # außerhalb beantwortet oder verschwunden zählt als erledigt
+            typ, data = m.uid("FETCH", ",".join(str(r["uid"]) for r in offen), "(UID FLAGS)")
+            flags = {}
+            for x in data or []:
+                line = x[0] if isinstance(x, tuple) else x
+                if isinstance(line, bytes):
+                    um = re.search(rb"UID (\d+)", line)
+                    if um:
+                        flags[int(um.group(1))] = line
+            for r in offen:
+                f = flags.get(r["uid"])
+                if f is None:
+                    fertig.append((r["uid"], "gelöscht oder verschoben"))
+                elif b"\\Answered" in f:
+                    fertig.append((r["uid"], "beantwortet"))
+    finally:
+        with contextlib.suppress(Exception):
+            m.logout()
+    ids = {}
+    with db() as conn:
+        for uid, betreff, absender, mid in neu:
+            ids[uid] = conn.execute("INSERT INTO mail_eingang (konto_id, uidvalidity, uid, message_id, betreff, absender, status, erkannt_am) "
+                                    "VALUES (?, ?, ?, ?, ?, ?, 'neu', ?)", (kid, int(uv or 0), uid, mid, betreff[:250], absender[:250], now_iso())).lastrowid
+    if len(neu) <= 3:
+        for uid, betreff, absender, _ in neu:
+            send_push(f"Neue Mail: {betreff[:80]}", f"von {pf_name(absender)} an {cfg['adresse']}", f"/#/mail/{kid}/m/INBOX/{uid}", f"mail-{ids[uid]}")
+    else:
+        send_push(f"{len(neu)} neue Mails an {cfg['adresse']}", ", ".join(b[:40] for _, b, *_ in neu[:3]) + " ...", f"/#/mail/{kid}", "mail-sammel")
+    for uid, aktion in fertig:
+        pf_mark_handled(kid, uid, aktion)
+    return len(neu)
+
+
+PF_LETZTER = {"zeit": 0}
+
+
+def pf_poll_alle():
+    if time.time() - PF_LETZTER["zeit"] < PF_POLL_SEKUNDEN:
+        return
+    PF_LETZTER["zeit"] = time.time()
+    with db() as conn:
+        konten = [k for k in aktive_konten(conn) if k["smtp_password"] and k["imap"]]
+    for cfg in konten:
+        try:
+            pf_poll(cfg)
+        except Exception as e:  # noqa: ein Konto mit Fehler hält die anderen nicht auf
+            print(f"Postfach-Abruf {cfg['adresse']}:", repr(e)[:200])
+
+
+PF_STATUS = {"zeit": 0, "daten": None}
+PF_STATUS_LOCK = threading.Lock()
+
+
+def pf_status():
+    """Ungelesene Mails je Konto (für die Zahl im Menü), höchstens jede Minute frisch vom Server."""
+    with PF_STATUS_LOCK:
+        if PF_STATUS["daten"] is not None and time.time() - PF_STATUS["zeit"] < 60:
+            return PF_STATUS["daten"]
+    with db() as conn:
+        konten = aktive_konten(conn)
+    out = []
+    for cfg in konten:
+        try:
+            out.append({"id": cfg["id"], "name": cfg["name"], "adresse": cfg["adresse"], "unseen": pfm.pf_unseen(cfg), "fehler": ""})
+        except Exception as e:  # noqa
+            out.append({"id": cfg["id"], "name": cfg["name"], "adresse": cfg["adresse"], "unseen": 0, "fehler": str(e)[:200]})
+    daten = {"unseen": sum(k["unseen"] for k in out), "konten": out}
+    with PF_STATUS_LOCK:
+        PF_STATUS.update(zeit=time.time(), daten=daten)
+    return daten
+
+
+def kunde_zur_adresse(conn, absender):
+    """Passt die Absenderadresse zu einem Kontakt, gehört die Mail zu dessen Kunden."""
+    from email.utils import parseaddr
+    adr = parseaddr(absender or "")[1].strip().lower()
+    if not adr:
+        return None
+    r = conn.execute("SELECT c.id AS kontakt_id, c.name AS kontakt, k.id AS kunde_id, k.name AS kunde FROM kontakte c JOIN kunden k ON k.id = c.kunde_id "
+                     "WHERE lower(trim(c.email))=? ORDER BY k.archiviert, c.id LIMIT 1", (adr,)).fetchone()
+    return row_dict(r) if r else None
+
+
 def audit_label(table, r):
     if table == "auftraege":
         return f"{datum_text(r['datum'])} {r['begegnung'] or ''}".strip()
@@ -1330,6 +1508,10 @@ def audit_label(table, r):
         return f"{r['art']} zu Auftrag {r['auftrag_id']}"
     if table == "lieferlinks":
         return f"{r['typ']}-Link zu Auftrag {r['auftrag_id']}"
+    if table == "mailkonten":
+        return r["adresse"] or ""
+    if table == "mail_verweise":
+        return r["betreff"] or r["message_id"] or ""
     if table == "vertraege":
         return f"{r['art']} ab {datum_text(r['beginn'])}"
     keys = r.keys()
@@ -1447,6 +1629,8 @@ def dashboard(conn, tag):
             "SELECT * FROM aufgaben WHERE status != 'Erledigt' AND faellig != '' AND faellig <= ? ORDER BY faellig, prioritaet='Niedrig', "
             "prioritaet='Mittel', id", (tag,))],
         "eigene_termine": [e for e in kalender_eintraege(conn, tag, (t + timedelta(days=14)).isoformat()) if e["art"] == "termin"],
+        "mails_neu": [row_dict(r) for r in conn.execute("SELECT e.id, e.konto_id, e.uid, e.betreff, e.absender, e.erkannt_am, k.adresse FROM mail_eingang e "
+                                                         "JOIN mailkonten k ON k.id = e.konto_id WHERE e.status='neu' ORDER BY e.id DESC LIMIT 20")],
     }
 
 
@@ -2193,6 +2377,10 @@ class Handler(BaseHTTPRequestHandler):
                     set_setting(conn, "ics_token_hash", "")
                     audit(conn, user, "Kalender-Abo abgeschaltet", "settings", None, "Kalender-Abo")
                 return self.send_json({"aktiv": bool(get_setting(conn, "ics_token_hash"))})
+        if head == "postfach":
+            return self.api_postfach(method, p[1:], user)
+        if head == "mailkonten" and len(p) == 3 and re.fullmatch(r"[0-9]{1,9}", p[1]) and p[2] in ("passwort", "pruefen"):
+            return self.api_mailkonto(method, int(p[1]), p[2], user)
         if p[:2] == ["kalender", "fremd"]:
             return self.api_fremd(method, p[2:], user)
         if method == "POST" and p == ["auftraege", "serie"]:
@@ -2252,6 +2440,9 @@ class Handler(BaseHTTPRequestHandler):
                     mit_ampel(conn, rows)
                 if table == "vertraege":
                     mit_fristen(rows)
+                if table == "mailkonten":
+                    for r_ in rows:
+                        r_["passwort_gesetzt"] = bool(secret_get(conn, f"mailkonto:{r_['id']}"))
                 return self.send_json(rows[0] if old else rows)
 
             if (method == "POST" and rid is None) or (method == "PUT" and old):
@@ -2267,6 +2458,13 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("UPDATE termine SET kunde_id=NULL WHERE kunde_id=?", (rid,))
                 if table == "pakete":
                     conn.execute("DELETE FROM aufgaben_vorlagen WHERE paket_id=?", (rid,))
+                if table == "mailkonten":   # Zugangsdaten, Abrufstand und Verweise des Kontos gehen mit
+                    conn.execute("DELETE FROM secrets WHERE key=? OR key LIKE ?", (f"mailkonto:{rid}", f"pf:{rid}:%"))
+                    conn.execute("DELETE FROM mail_eingang WHERE konto_id=?", (rid,))
+                    conn.execute("UPDATE aufgaben SET mail_verweis_id=NULL WHERE mail_verweis_id IN (SELECT id FROM mail_verweise WHERE konto_id=?)", (rid,))
+                    conn.execute("DELETE FROM mail_verweise WHERE konto_id=?", (rid,))
+                if table == "mail_verweise":
+                    conn.execute("UPDATE aufgaben SET mail_verweis_id=NULL WHERE mail_verweis_id=?", (rid,))
                 if table == "auftraege":   # nur, solange keine Zahlung erfasst ist: die offenen Zahlungen gehen mit
                     if conn.execute("SELECT 1 FROM zahlungen WHERE auftrag_id=? AND (status != 'Offen' OR IFNULL(finom_abgerechnet, 0))",
                                     (rid,)).fetchone():
@@ -2288,6 +2486,276 @@ class Handler(BaseHTTPRequestHandler):
                       {k: v for k, v in row_dict(old).items() if k not in AUDIT_SKIP and v not in (None, "")})
                 return self.send_json({"ok": True})
         return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+
+    # -- Mailkonto: Passwort setzen, Verbindung prüfen ---------------------
+    def api_mailkonto(self, method, kid, was, user):
+        with db() as conn:
+            if not conn.execute("SELECT 1 FROM mailkonten WHERE id=?", (kid,)).fetchone():
+                return self.send_json({"error": "Dieses Mailkonto gibt es nicht."}, 404)
+            if was == "passwort" and method == "PUT":
+                pw = str(self.read_json().get("passwort") or "")
+                if not pw or len(pw) > 300:
+                    raise BadRequest("Bitte das Passwort eingeben.")
+                secret_set(conn, f"mailkonto:{kid}", pw)
+                audit(conn, user, "Passwort des Mailkontos gesetzt", "mailkonten", kid, "")
+                PF_STATUS["daten"] = None
+                return self.send_json({"ok": True})
+            if was == "pruefen" and method == "POST":
+                cfg = konto_cfg(conn, kid)
+            else:
+                return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+        return self.send_json(pfm.mail_account_check(cfg))   # meldet sich an SMTP und IMAP an, verschickt nichts
+
+    # -- Postfach (/api/postfach/<sub>?konto=<id>), nach api_postfach im Hub --
+    def api_postfach(self, method, p, user):
+        sub = p[0] if p else ""
+        q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+        if sub == "status" and method == "GET":
+            return self.send_json(pf_status())
+        if sub == "konten" and method == "GET":
+            with db() as conn:
+                return self.send_json([{"id": k["id"], "name": k["name"], "adresse": k["adresse"], "bereit": bool(k["smtp_password"] and k["imap"])}
+                                       for k in aktive_konten(conn)])
+        body = self.read_json() if method == "POST" else {}
+        kid = str(q.get("konto") or body.get("konto") or "")
+        if not kid.isdigit():
+            raise BadRequest("Bitte ein Mailkonto wählen.")
+        kid = int(kid)
+        folder = str(q.get("folder") or body.get("folder") or "INBOX")[:200]
+        uid = str(q.get("uid") or body.get("uid") or "")
+        if uid and not uid.isdigit():
+            raise BadRequest("Ungültige Mail.")
+        with db() as conn:
+            cfg = konto_cfg(conn, kid)
+        m = None
+        try:
+            if sub == "verweis" and method == "POST":   # Mail mit Kunde oder Auftrag verknüpfen (gespeichert wird nur der Verweis)
+                data = body
+                with db() as conn:
+                    out = speichern(conn, "mail_verweise", {"konto_id": kid, "ordner": folder, "message_id": str(data.get("message_id") or "")[:300],
+                                                            "betreff": str(data.get("betreff") or "")[:250], "absender": str(data.get("absender") or "")[:250],
+                                                            "kunde_id": data.get("kunde_id") or None, "auftrag_id": data.get("auftrag_id") or None}, None, user)
+                return self.send_json(out, 201)
+            if sub == "handled" and method == "POST":   # "Erledigt": in den Ordner Erledigt verschieben
+                if not uid:
+                    raise BadRequest("Ungültige Mail.")
+                ok = pf_mark_handled(kid, int(uid), "als erledigt markiert") if folder == "INBOX" else True
+                try:
+                    moved = pfm.pf_move_to_done(folder, int(uid), cfg)
+                except Exception as e:  # noqa
+                    return self.send_json({"ok": ok, "moved": False, "note": f"Erledigt, aber nicht verschoben: {e}"})
+                return self.send_json({"ok": ok, "moved": bool(moved), "folder": moved[0] if moved else folder, "uid": moved[1] if moved else int(uid)})
+            m, _ = pfm.postfach_open(cfg)
+            if sub == "folders" and method == "GET":
+                if not pfm.pf_done_folder(m, create=False):   # Ordner "Erledigt" immer anzeigen
+                    with contextlib.suppress(Exception):
+                        pfm.pf_done_folder(m)
+                folders = pfm.postfach_folders(m)
+                for f in folders:
+                    if not f["role"] and f["label"].upper().startswith("INBOX."):   # Strato und Co.: "INBOX.Kunden" als "Kunden" zeigen
+                        f["label"] = f["label"][6:]
+                    if f["role"] == "inbox":
+                        typ, data = m.status(imap_quote(f["name"]), "(UNSEEN)")
+                        mm = re.search(rb"UNSEEN (\d+)", data[0] if data else b"")
+                        f["unseen"] = int(mm.group(1)) if mm else 0
+                with db() as conn:
+                    konten = [{"id": k["id"], "name": k["name"], "adresse": k["adresse"]} for k in aktive_konten(conn)]
+                return self.send_json({"folders": folders, "konto": kid, "adresse": cfg["adresse"], "name": cfg["name"], "konten": konten,
+                                       "signatur": cfg["signatur"]})
+            if sub == "messages" and method == "GET":
+                from email import policy
+                from email.parser import BytesHeaderParser
+                pfm.pf_select(m, folder)
+                term = (q.get("q") or "").strip()[:100]
+                if term:
+                    m.literal = term.encode("utf-8")   # als Literal, damit auch Umlaute gesucht werden können
+                    typ, data = m.uid("SEARCH", "CHARSET", "UTF-8", "TEXT")
+                else:
+                    typ, data = m.uid("SEARCH", None, "ALL")
+                uids = (data[0] or b"").split()[::-1]
+                page = int(q.get("page") or 0) if (q.get("page") or "0").isdigit() else 0
+                sel = uids[page * pfm.PF_PAGE:(page + 1) * pfm.PF_PAGE]
+                items = []
+                if sel:
+                    typ, data = m.uid("FETCH", b",".join(sel), "(UID FLAGS RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)])")
+                    for x in data or []:
+                        if not isinstance(x, tuple):
+                            continue
+                        meta = x[0]
+                        um = re.search(rb"UID (\d+)", meta)
+                        if not um:
+                            continue
+                        h = BytesHeaderParser(policy=policy.compat32).parsebytes(x[1])
+                        fl = re.search(rb"FLAGS \(([^)]*)\)", meta)
+                        flags = (fl.group(1) if fl else b"").decode()
+                        low = meta.lower()
+                        items.append({"uid": int(um.group(1)), "from": pf_head(h.get("From")), "to": pf_head(h.get("To")),
+                                      "subject": pf_head(h.get("Subject")) or "(ohne Betreff)", "date": h.get("Date") or "",
+                                      "seen": "\\Seen" in flags, "answered": "\\Answered" in flags, "flagged": "\\Flagged" in flags,
+                                      "attachment": b'"attachment"' in low or b'("name"' in low or b'"filename"' in low})
+                    items.sort(key=lambda i: -i["uid"])
+                    with db() as conn:
+                        frisch = {r["uid"]: r["status"] for r in conn.execute("SELECT uid, status FROM mail_eingang WHERE konto_id=?", (kid,))} if folder == "INBOX" else {}
+                        for it in items:
+                            it["inbox"] = frisch.get(it["uid"], "")
+                            k_ = kunde_zur_adresse(conn, it["from"])
+                            it["kunde"] = k_["kunde"] if k_ else ""
+                return self.send_json({"folder": folder, "total": len(uids), "page": page, "pages": max(1, -(-len(uids) // pfm.PF_PAGE)), "items": items})
+            if sub == "message" and method == "GET" and uid:
+                msg, flags = pfm.pf_message(m, folder, uid, mark_seen=q.get("peek") != "1")
+                mid = (msg.get("Message-ID") or "").strip()
+                with db() as conn:
+                    kunde = kunde_zur_adresse(conn, pf_head(msg.get("Reply-To")) or pf_head(msg.get("From")))
+                    verweise = [row_dict(r) for r in conn.execute(
+                        "SELECT v.*, k.name AS kunde, a.begegnung, a.datum FROM mail_verweise v LEFT JOIN kunden k ON k.id = v.kunde_id "
+                        "LEFT JOIN auftraege a ON a.id = v.auftrag_id WHERE v.message_id=? AND v.message_id != '' ORDER BY v.id", (mid,))]
+                    ib = conn.execute("SELECT status, aktion, erledigt_am FROM mail_eingang WHERE konto_id=? AND uid=? ORDER BY id DESC",
+                                      (kid, int(uid))).fetchone() if folder == "INBOX" else None
+                return self.send_json({"konto": kid, "uid": int(uid), "folder": folder, "message_id": mid, "kunde": kunde, "verweise": verweise,
+                                       "inbox": row_dict(ib) if ib else None, "signatur": cfg["signatur"], "adresse": cfg["adresse"],
+                                       "from": pf_head(msg.get("From")), "to": pf_head(msg.get("To")), "cc": pf_head(msg.get("Cc")),
+                                       "reply_to": pf_head(msg.get("Reply-To")), "subject": pf_head(msg.get("Subject")) or "(ohne Betreff)",
+                                       "date": msg.get("Date") or "", "text": pfm.pf_text(msg), "attachments": pfm.pf_attachments(msg),
+                                       "answered": b"\\Answered" in flags})
+            if sub == "finde" and method == "GET":   # Mail zu einem Verweis wiederfinden (sie kann inzwischen in Erledigt liegen)
+                with db() as conn:
+                    v = conn.execute("SELECT * FROM mail_verweise WHERE id=? AND konto_id=?", (int(q.get("verweis") or 0), kid)).fetchone()
+                if not v or not v["message_id"]:
+                    return self.send_json({"error": "Verweis nicht gefunden."}, 404)
+                for f in [v["ordner"] or "INBOX"] + [x["name"] for x in pfm.postfach_folders(m) if x["name"] != v["ordner"]]:
+                    with contextlib.suppress(Exception):
+                        pfm.pf_select(m, f)
+                        typ, d2 = m.uid("SEARCH", None, "HEADER", "Message-ID", v["message_id"])
+                        found = (d2[0] or b"").split()
+                        if found:
+                            return self.send_json({"folder": f, "uid": int(found[-1])})
+                return self.send_json({"error": "Die Mail ist im Postfach nicht mehr zu finden."}, 404)
+            if sub == "attachment" and method == "GET" and uid and (q.get("i") or "").isdigit():
+                msg, _ = pfm.pf_message(m, folder, uid, mark_seen=False)
+                parts = list(msg.iter_attachments())
+                i = int(q["i"])
+                if i >= len(parts):
+                    return self.send_json({"error": "Anhang nicht gefunden."}, 404)
+                data = parts[i].get_payload(decode=True) or b""
+                name = re.sub(r'[^\w.\- ()äöüÄÖÜß]', "_", pf_head(parts[i].get_filename() or "") or f"anhang-{i + 1}")[:150]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")   # nie im Tool anzeigen (kein HTML/SVG im eigenen Kontext)
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return self.wfile.write(data)
+            if sub == "flag" and method == "POST":
+                if not uid:
+                    raise BadRequest("Ungültige Mail.")
+                pfm.pf_select(m, folder, readonly=False)
+                flag = {"seen": "\\Seen", "flagged": "\\Flagged"}.get(body.get("flag") or "seen", "\\Seen")
+                m.uid("STORE", uid, "+FLAGS" if body.get("value") else "-FLAGS", f"({flag})")
+                with PF_STATUS_LOCK:
+                    PF_STATUS["daten"] = None
+                return self.send_json({"ok": True})
+            if sub == "delete" and method == "POST":
+                if not uid:
+                    raise BadRequest("Ungültige Mail.")
+                msg, _ = pfm.pf_message(m, folder, uid, mark_seen=False)
+                trash = pfm.pf_role_folder(m, "trash")
+                pfm.pf_select(m, folder, readonly=False)
+                if trash and trash != folder:
+                    typ, _ = m.uid("COPY", uid, imap_quote(trash))
+                    if typ != "OK":
+                        raise BadRequest("Verschieben in den Papierkorb fehlgeschlagen.")
+                    aktion = "in den Papierkorb"
+                else:
+                    aktion = "endgültig gelöscht"
+                m.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+                m.expunge()
+                if folder == "INBOX":
+                    pf_mark_handled(kid, int(uid), "gelöscht")
+                with db() as conn:
+                    audit(conn, user, "Mail gelöscht", "postfach", kid, pf_head(msg.get("Subject"))[:100], {"Von": pf_head(msg.get("From")), "Wohin": aktion})
+                return self.send_json({"ok": True, "action": aktion})
+            if sub == "send" and method == "POST":
+                return self.pf_senden(m, cfg, body, user)
+            return self.send_json({"error": "Unbekannte Schnittstelle"}, 404)
+        except PostfachError as e:
+            return self.send_json({"error": str(e)}, 400)
+        except BadRequest:
+            raise
+        except Exception as e:  # noqa
+            return self.send_json({"error": f"Fehler beim Postfach: {type(e).__name__}: {e}"}, 502)
+        finally:
+            if m is not None:
+                with contextlib.suppress(Exception):
+                    m.logout()
+
+    def pf_senden(self, m, cfg, data, user):
+        """Antworten, Allen antworten, Weiterleiten, Neue Mail (wie im Hub). Absender: das gewählte Konto ("von")."""
+        from email.utils import getaddresses
+        addr_re = r"[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+"
+
+        def addrs(v):
+            out = [a for _, a in getaddresses([str(v or "")]) if a]
+            return out if all(re.fullmatch(addr_re, a) for a in out) else None
+        to, cc = addrs(data.get("to")), addrs(data.get("cc"))
+        subject = str(data.get("subject") or "").strip()[:250]
+        text_body = str(data.get("body") or "")[:100000]
+        qd = data.get("quote") if isinstance(data.get("quote"), dict) else {}
+        q_head, q_text, q_fwd = str(qd.get("head") or "")[:2000], str(qd.get("text") or "")[:200000], bool(qd.get("forward"))
+        if not to or cc is None or len(to) + len(cc) > 20:
+            raise BadRequest("Bitte gültige Empfänger angeben (mehrere mit Komma, höchstens 20).")
+        if not subject or not text_body.strip():
+            raise BadRequest("Bitte Betreff und Text ausfüllen.")
+        von = str(data.get("von") or cfg["id"])
+        sender = cfg
+        if von.isdigit() and int(von) != cfg["id"]:
+            with db() as conn:
+                sender = konto_cfg(conn, int(von))
+        headers = {}
+        reply = data.get("reply") if isinstance(data.get("reply"), dict) else None
+        if reply and str(reply.get("uid") or "").isdigit():
+            orig, _ = pfm.pf_message(m, str(reply.get("folder") or "INBOX")[:200], str(reply["uid"]), mark_seen=False)
+            mid = (orig.get("Message-ID") or "").strip()
+            if mid:
+                headers = {"In-Reply-To": mid, "References": ((orig.get("References") or "") + " " + mid).strip()}
+        sig = sender["signatur"] if data.get("signature", True) is not False else ""
+        quoted = (q_text if q_fwd else "\n".join("> " + zeile for zeile in q_text.split("\n"))) if q_text else ""
+        text = text_body.rstrip() + (("\n\n" + sig) if sig else "") + (("\n\n\n" + q_head + "\n" + quoted) if (q_head or quoted) else "")
+        para = lambda t: htmlmod.escape(t).replace("\n", "<br>\n")  # noqa: E731
+        html = ('<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:20px;color:#1a1a1a;">' + para(text_body.rstrip()) + "</div>"
+                + (f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:19px;color:#444444;margin-top:16px;">{para(sig)}</div>' if sig else "")
+                + ((f'<div style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#555555;margin-top:20px;">{para(q_head)}</div>'
+                    f'<blockquote style="margin:6px 0 0;padding-left:12px;border-left:3px solid #dddddd;color:#555555;font-family:Arial,Helvetica,sans-serif;font-size:13px;">{para(q_text)}</blockquote>')
+                   if (q_head or q_text) else ""))
+        out = {}
+        err = pfm.send_mail(sender, ", ".join(to), subject, text, headers=headers, cc=cc, out=out, html=html)
+        if err:
+            raise BadRequest(f"Versand fehlgeschlagen: {err}")
+        note = ""
+        try:
+            if reply and str(reply.get("uid") or "").isdigit():
+                pfm.pf_select(m, str(reply.get("folder") or "INBOX")[:200], readonly=False)
+                m.uid("STORE", str(reply["uid"]), "+FLAGS", "(\\Answered)")
+            if out.get("raw"):
+                import imaplib
+                box = m if sender["id"] == cfg["id"] else pfm.postfach_open(sender)[0]   # Kopie in "Gesendet" des Kontos, über das verschickt wurde
+                try:
+                    sent = pfm.pf_role_folder(box, "sent")
+                    if sent:
+                        box.append(imap_quote(sent), "(\\Seen)", imaplib.Time2Internaldate(time.time()), out["raw"])
+                finally:
+                    if box is not m:
+                        with contextlib.suppress(Exception):
+                            box.logout()
+        except Exception as e:  # noqa
+            note = f"Verschickt, aber nicht unter Gesendet abgelegt ({type(e).__name__})."
+        src = data.get("source") if isinstance(data.get("source"), dict) else None
+        if reply and str(reply.get("uid") or "").isdigit() and str(reply.get("folder") or "INBOX") == "INBOX":
+            pf_mark_handled(cfg["id"], int(reply["uid"]), "beantwortet")
+        elif src and str(src.get("uid") or "").isdigit() and str(src.get("folder") or "INBOX") == "INBOX":
+            pf_mark_handled(cfg["id"], int(src["uid"]), "weitergeleitet")
+        with db() as conn:
+            audit(conn, user, "Mail gesendet", "postfach", sender["id"], subject[:100], {"An": ", ".join(to + cc), "Von": sender["adresse"]})
+        return self.send_json({"ok": True, "note": note, "von": sender["adresse"]})
 
     # -- Fremder Kalender (/api/kalender/fremd) -----------------------------
     def api_fremd(self, method, p, user):
@@ -2533,6 +3001,7 @@ def main():
         return cli()
     httpd = make_server()
     threading.Thread(target=backup_loop, daemon=True).start()
+    HINTERGRUND_EXTRA.append(pf_poll_alle)
     threading.Thread(target=hintergrund_loop, daemon=True).start()
     print("=" * 56)
     print(f"  {APP_NAME} {VERSION}")

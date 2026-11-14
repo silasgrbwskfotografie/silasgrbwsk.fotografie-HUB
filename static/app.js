@@ -60,7 +60,7 @@ const TAB_LABELS = { start: 'Start', auftraege: 'Aufträge', mail: 'Mail', kalen
 const icon = k => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[k]}</svg>`;
 
 function renderTabbar() {
-  $('#tabbar').innerHTML = TABS.map(t => `<a href="#/${t === 'start' ? '' : t}" data-tab="${t}">${icon(t)}<span>${TAB_LABELS[t]}</span></a>`).join('')
+  $('#tabbar').innerHTML = TABS.map(t => `<a href="#/${t === 'start' ? '' : t}" data-tab="${t}">${icon(t)}<span>${TAB_LABELS[t]}</span>${t === 'mail' ? '<span class="tab-badge hidden" data-mailbadge></span>' : ''}</a>`).join('')
     + `<button type="button" id="tabMore">${icon('mehr')}<span>Mehr</span></button>`;
   $('#tabMore').addEventListener('click', () => document.body.classList.toggle('nav-open'));
 }
@@ -92,7 +92,6 @@ function head(title, sub) {
 
 /* Seiten, die in späteren Phasen gebaut werden */
 const LATER = {
-  mail: [9, 'Postfach wie im Emden Tigers Hub, mit mehreren Konten.'],
 };
 Object.entries(LATER).forEach(([key, [phase, text]]) => {
   App.pages[key] = async (view) => {

@@ -227,3 +227,41 @@ a.linkbtn{text-decoration:none}
 .rot{color:var(--bad)}
 details{padding:6px 0;border-bottom:1px solid var(--line)}
 summary{cursor:pointer}
+
+/* Phase 9: Postfach (nach .pf-* im Hub) */
+.nav-badge,.tab-badge{display:inline-block;min-width:18px;padding:0 5px;border-radius:99px;background:var(--bad);color:#fff;font-size:11px;font-weight:700;line-height:18px;text-align:center}
+#tabbar a{position:relative}
+.tab-badge{position:absolute;top:2px;left:calc(50% + 6px)}
+.nav-badge.hidden,.tab-badge.hidden{display:none}
+.pf-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap}
+.pf-layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:14px;align-items:start}
+.pf-folders{display:flex;flex-direction:column;gap:2px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:8px}
+.pf-folders a{padding:8px 10px;border-radius:7px;text-decoration:none;color:inherit;display:flex;justify-content:space-between;align-items:center;gap:6px}
+.pf-folders a.active{background:var(--ink);color:#fff}
+.pf-folders .badge{margin:0}
+.pf-boxes{display:flex;flex-direction:column;gap:2px;padding-bottom:8px;margin-bottom:6px;border-bottom:1px solid var(--line)}
+.pf-boxes a{font-size:13px;font-weight:600;word-break:break-all}
+.pf-boxes a.active{background:var(--accent);color:#fff}
+.pf-done{margin-left:8px;border:1px solid var(--line);background:#fff;border-radius:6px;padding:1px 7px;font-size:13px;cursor:pointer;color:var(--ok)}
+.pf-done:hover{background:var(--ok-soft)}
+.pf-list{padding:0;overflow:hidden}
+.pf-leer{padding:14px}
+.pf-row{display:grid;grid-template-columns:minmax(0,190px) minmax(0,1fr) auto;gap:12px;padding:11px 14px;border-bottom:1px solid var(--line);text-decoration:none;color:inherit;align-items:center}
+.pf-row:hover{background:var(--bg)}
+.pf-row.unread{font-weight:700}
+.pf-row.unread .pf-from::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);margin-right:7px;vertical-align:middle}
+.pf-row .badge{margin:0}
+.pf-from,.pf-subj{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pf-date{font-size:12px;color:var(--ink-3);white-space:nowrap}
+.pf-text{white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:14px;line-height:1.55;margin:16px 0 0;padding-top:14px;border-top:1px solid var(--line)}
+.pf-zitat{max-height:220px;overflow:auto}
+.pf-att{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.pf-tasks{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:10px 0}
+.pf-tasks .badge{margin:0}
+.pf-aus{align-items:center;margin-bottom:10px}
+.pf-betreff{text-transform:none;letter-spacing:0;font-size:18px;color:var(--ink);margin:6px 0 8px}
+.pf-sig{white-space:pre-wrap;font-family:inherit;font-size:13px;background:var(--bg);border-radius:8px;padding:8px 10px;margin:6px 0 0}
+.pf-sig.hidden{display:none}
+@media (max-width:800px){.pf-layout{grid-template-columns:1fr}.pf-folders{flex-direction:row;overflow-x:auto;white-space:nowrap}
+  .pf-boxes{flex-direction:row;border-bottom:0;border-right:1px solid var(--line);padding:0 6px 0 0;margin:0 4px 0 0}.pf-boxes a{word-break:normal}
+  .pf-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"from date" "subj subj";gap:2px 10px}.pf-from{grid-area:from}.pf-subj{grid-area:subj;font-weight:inherit}.pf-date{grid-area:date}}
