@@ -25,6 +25,7 @@ import calendar
 import contextlib
 import csv
 import io
+import ipaddress
 import getpass
 import hashlib
 import hmac
@@ -33,6 +34,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import sys
 import threading
@@ -48,7 +50,7 @@ from zoneinfo import ZoneInfo
 import webpush
 from webpush import b64u, b64u_dec, ec_pub_point, push_endpoint_ok
 
-VERSION = "0.8"
+VERSION = "0.9"
 APP_NAME = "Studio-Tool"
 ENV = os.environ.get
 HOST = ENV("STUDIO_HOST", "127.0.0.1")
@@ -237,8 +239,9 @@ TABLES = {
         "ganztaegig": "INTEGER DEFAULT 0",
         "ort": "TEXT",
         "art": "TEXT",                                   # Besprechung, Vorbereitung, privat geblockt ...
-        "wiederholung": "TEXT",
-        "erinnerung_min": "INTEGER",
+        "wiederholung": "TEXT",                          # leer, täglich, wöchentlich, monatlich, jährlich
+        "wiederholung_bis": "TEXT",
+        "erinnerung_min": "INTEGER",                     # Push so viele Minuten vor Beginn, leer: keine
         "kunde_id": "INTEGER REFERENCES kunden(id)",
         "auftrag_id": "INTEGER REFERENCES auftraege(id)",
         "notizen": "TEXT",
@@ -259,6 +262,13 @@ TABLES = {
         "erledigt_am": "TEXT",
         "erstellt_am": "TEXT",
         "geaendert_am": "TEXT",
+    },
+    "aufgaben_vorlagen": {                               # Aufgaben, die beim Anlegen eines Auftrags entstehen
+        "paket_id": "INTEGER REFERENCES pakete(id)",
+        "titel": "TEXT NOT NULL",
+        "tage_offset": "INTEGER DEFAULT 0",              # fällig: Datum des Auftrags plus so viele Tage (auch negativ)
+        "prioritaet": "TEXT DEFAULT 'Mittel'",
+        "sort": "INTEGER DEFAULT 0",
     },
     "push_abos": {                                       # angemeldetes Gerät
         "endpoint": "TEXT",                              # eindeutig über ux_push_endpoint
@@ -302,6 +312,13 @@ SEED_PAKETE = (
     {"name": "Saisonspiel HSG Emden", "grundpreis_cent": 3500, "inkl_spieler": 0, "zusatzspieler_cent": 0, "sort": 4},
 )
 
+# Standard-Aufgaben je Paket (Liste aus der Planung), mit Tagen relativ zum Auftrag
+SEED_AUFGABEN = (("Akkus laden", -1), ("Bilder sichern", 0), ("Auswahl bearbeiten", 1), ("Galerie hochladen", 3),
+                 ("Link verschicken", 3), ("Zahlung prüfen", 7))
+WIEDERHOLUNGEN = ("", "täglich", "wöchentlich", "monatlich", "jährlich")
+PRIORITAETEN = ("Hoch", "Mittel", "Niedrig")
+STATUS_AUFGABE = ("Offen", "In Arbeit", "Erledigt")
+
 DB_LOCK = threading.RLock()
 
 
@@ -341,6 +358,7 @@ def init_db():
                      "recovery TEXT, enabled_at TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS secrets (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS erinnerungen (schluessel TEXT PRIMARY KEY, zeit TEXT)")   # schon gesendete Push-Erinnerungen
         conn.execute("CREATE TABLE IF NOT EXISTS audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT, user_id INTEGER, "
                      "user_name TEXT, action TEXT, table_name TEXT, record_id INTEGER, label TEXT, details TEXT)")
         for table, cols in TABLES.items():
@@ -371,6 +389,14 @@ def seed(conn):
                              "VALUES (?, ?, ?, ?, '', 1, ?)",
                              (p["name"], p["grundpreis_cent"], p["inkl_spieler"], p["zusatzspieler_cent"], p["sort"]))
         conn.execute("INSERT INTO settings (key, value) VALUES ('seed_pakete', ?)", (now_iso(),))
+    if not conn.execute("SELECT 1 FROM settings WHERE key='seed_aufgaben'").fetchone():
+        # Liste aus der Planung, je Paket. Die Tage relativ zum Auftrag sind ein Vorschlag, in den Einstellungen änderbar.
+        if not conn.execute("SELECT COUNT(*) FROM aufgaben_vorlagen").fetchone()[0]:
+            for (pid,) in conn.execute("SELECT id FROM pakete ORDER BY sort, id").fetchall():
+                for i, (titel, tage) in enumerate(SEED_AUFGABEN, 1):
+                    conn.execute("INSERT INTO aufgaben_vorlagen (paket_id, titel, tage_offset, prioritaet, sort) VALUES (?, ?, ?, 'Mittel', ?)",
+                                 (pid, titel, tage, i))
+        conn.execute("INSERT INTO settings (key, value) VALUES ('seed_aufgaben', ?)", (now_iso(),))
     if not conn.execute("SELECT 1 FROM settings WHERE key='seed_vorlagen'").fetchone():
         if not conn.execute("SELECT COUNT(*) FROM vorlagen").fetchone()[0]:
             conn.execute("INSERT INTO vorlagen (name, text, sort) VALUES (?, ?, 1)", ("Galerie ist online (Beispiel, bitte anpassen)",
@@ -699,11 +725,14 @@ def twofa_reset(username):
 # ---------------------------------------------------------------------------
 # Phase 2: Kunden, Kontakte, Pakete, Aufträge (allgemeine Tabellen-Schnittstelle wie api_table im Hub)
 # ---------------------------------------------------------------------------
-API_TABLES = ("kunden", "kontakte", "pakete", "auftraege", "zahlungen", "lieferlinks", "vorlagen", "vertraege", "dokumente")
+API_TABLES = ("kunden", "kontakte", "pakete", "auftraege", "zahlungen", "lieferlinks", "vorlagen", "vertraege", "dokumente",
+              "termine", "aufgaben", "aufgaben_vorlagen")
 ORDER = {"kunden": "name COLLATE NOCASE, id", "kontakte": "name COLLATE NOCASE, id", "pakete": "sort, id",
          "auftraege": "datum, uhrzeit, id", "zahlungen": "auftrag_id, art = 'Zahlung', id",
          "lieferlinks": "auftrag_id, erstellt_am, id", "vorlagen": "sort, id", "vertraege": "beginn, id",
-         "dokumente": "hochgeladen_am DESC, id"}
+         "dokumente": "hochgeladen_am DESC, id", "termine": "beginn, id",
+         "aufgaben": "status = 'Erledigt', faellig = '', faellig IS NULL, faellig, prioritaet = 'Niedrig', prioritaet = 'Mittel', sort, id",
+         "aufgaben_vorlagen": "paket_id, sort, id"}
 # Diese Felder setzt nur der Server (Preise, Fristen, Zeitstempel)
 SERVER_FIELDS = {
     "kunden": ("erstellt_am", "geaendert_am"),
@@ -712,6 +741,8 @@ SERVER_FIELDS = {
     "lieferlinks": ("erstellt_am",),
     "vertraege": ("erstellt_am", "geaendert_am", "datei", "datei_name"),
     "dokumente": ("hochgeladen_am", "datei", "datei_name", "groesse"),
+    "aufgaben": ("erstellt_am", "geaendert_am", "erledigt_am"),
+    "termine": ("erstellt_am", "geaendert_am"),
     "auftraege": ("erstellt_am", "geaendert_am", "serie", "grundpreis_cent", "inkl_spieler", "zusatz_je_spieler_cent",
                   "anfahrt_frei_km", "anfahrt_cent_je_km", "zusatzspieler_cent", "anfahrt_cent", "lieferfrist"),
 }
@@ -731,6 +762,9 @@ def preis(grund, inkl, je_spieler, spieler, km, frei_km, cent_je_km):
     return zusatz, anfahrt, grund + zusatz + anfahrt
 
 
+NEGATIV_OK = {"tage_offset"}
+
+
 def clean_values(table, data):
     """Nur bekannte Spalten, Zahlen als ganze Zahl ab 0, Texte gekürzt."""
     cols = TABLES[table]
@@ -746,7 +780,7 @@ def clean_values(table, data):
                     v = int(v) if not isinstance(v, float) or v.is_integer() else None
                 except (TypeError, ValueError):
                     v = None
-                if v is None or not 0 <= v < 10 ** 9:
+                if v is None or not (-3650 if k in NEGATIV_OK else 0) <= v < 10 ** 9:
                     raise BadRequest(f"{k}: bitte eine ganze Zahl ab 0 eingeben.")
         else:
             v = None if v is None else str(v).strip()[:10000 if k == "notizen" else 500]
@@ -829,6 +863,124 @@ def check_row(conn, table, row):
             raise BadRequest("Unbekannte Einheit der Kündigungsfrist.")
     if table == "dokumente" and (not row.get("kunde_id") or not row.get("titel")):
         raise BadRequest("Bitte Kunde und Titel eingeben.")
+    if table in ("aufgaben", "aufgaben_vorlagen") and not row.get("titel"):
+        raise BadRequest("Bitte einen Titel eingeben.")
+    if table in ("aufgaben", "aufgaben_vorlagen") and (row.get("prioritaet") or "Mittel") not in PRIORITAETEN:
+        raise BadRequest("Unbekannte Priorität.")
+    if table == "aufgaben":
+        if (row.get("status") or "Offen") not in STATUS_AUFGABE:
+            raise BadRequest("Unbekannter Status.")
+        if row.get("faellig"):
+            try:
+                date.fromisoformat(row["faellig"])
+            except ValueError:
+                raise BadRequest("Bitte ein gültiges Fälligkeitsdatum eingeben.")
+    if table in ("aufgaben", "termine") and (row.get("wiederholung") or "") not in WIEDERHOLUNGEN:
+        raise BadRequest("Unbekannte Wiederholung.")
+    if table == "termine":
+        if not row.get("titel"):
+            raise BadRequest("Bitte einen Titel eingeben.")
+        b, e = termin_zeit(row)
+        if not b:
+            raise BadRequest("Bitte Beginn angeben (Datum, bei Uhrzeit als Datum und Zeit).")
+        if row.get("ende") and not e:
+            raise BadRequest("Ende ungültig.")
+        if e and e < b:
+            raise BadRequest("Das Ende liegt vor dem Beginn.")
+        if row.get("wiederholung_bis"):
+            try:
+                date.fromisoformat(row["wiederholung_bis"])
+            except ValueError:
+                raise BadRequest("Wiederholung bis: bitte ein gültiges Datum.")
+
+
+def termin_zeit(t):
+    """Beginn und Ende als datetime (lokal). Ganztägig: JJJJ-MM-TT, sonst JJJJ-MM-TTTHH:MM. Ungültig: (None, None)."""
+    def lesen(v, ende=False):
+        v = (v or "").strip()
+        try:
+            if t.get("ganztaegig"):
+                d = date.fromisoformat(v[:10])
+                return datetime(d.year, d.month, d.day) + (timedelta(days=1) if ende else timedelta())
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", v):
+                return None
+            return datetime.fromisoformat(v)
+        except ValueError:
+            return None
+    b = lesen(t.get("beginn"))
+    e = lesen(t.get("ende"), True) if t.get("ende") else None
+    if b and not e:
+        e = b + (timedelta(days=1) if t.get("ganztaegig") else timedelta(hours=1))
+    return b, e
+
+
+def naechstes(d, wiederholung):
+    if wiederholung == "täglich":
+        return d + timedelta(days=1)
+    if wiederholung == "wöchentlich":
+        return d + timedelta(days=7)
+    if wiederholung == "monatlich":
+        return plus_monate(d, 1)
+    if wiederholung == "jährlich":
+        return plus_monate(d, 12)
+    return None
+
+
+def termin_vorkommen(t, von, bis):
+    """Alle Vorkommen eines Termins, die den Zeitraum [von, bis] (date) berühren: Liste von (beginn, ende) als datetime.
+    Monatlich am 31. landet in kürzeren Monaten am Monatsende (gerechnet vom ersten Termin aus, nicht fortgeschrieben)."""
+    b, e = termin_zeit(t)
+    if not b:
+        return []
+    dauer = e - b
+    w = t.get("wiederholung") or ""
+    grenze = date.fromisoformat(t["wiederholung_bis"]) if t.get("wiederholung_bis") else None
+    out = []
+    for n in range(5000):   # Schutz vor Endlosschleifen
+        if n == 0:
+            x = b
+        elif w in ("monatlich", "jährlich"):
+            x = datetime.combine(plus_monate(b.date(), n * (1 if w == "monatlich" else 12)), b.time())
+        elif w:
+            x = b + n * (timedelta(days=1) if w == "täglich" else timedelta(days=7))
+        else:
+            break
+        if x.date() > bis or (grenze and x.date() > grenze):
+            break
+        if (x + dauer).date() >= von or x.date() >= von:
+            if (x + dauer) > datetime.combine(von, datetime.min.time()) or x.date() >= von:
+                out.append((x, x + dauer))
+    return out
+
+
+def ueberschneidungen(conn, beginn, ende, ausser=None):
+    """Termine und Aufträge mit Uhrzeit, die sich mit [beginn, ende) überschneiden. ausser: ("termin"|"auftrag", id)."""
+    tag = beginn.date()
+    treffer = []
+    for a in conn.execute("SELECT id, datum, uhrzeit, begegnung FROM auftraege WHERE datum >= ? AND datum <= ? AND IFNULL(uhrzeit, '') != '' "
+                          "AND status != 'Abgesagt' AND IFNULL(archiviert, 0)=0", ((tag - timedelta(days=1)).isoformat(), ende.date().isoformat())):
+        if ausser == ("auftrag", a["id"]):
+            continue
+        ab = datetime.fromisoformat(f"{a['datum']}T{a['uhrzeit']}")
+        if ab < ende and beginn < ab + timedelta(minutes=ICS_DAUER_MIN):
+            treffer.append({"art": "auftrag", "id": a["id"], "titel": a["begegnung"] or "Auftrag", "beginn": ab.isoformat(timespec="minutes")})
+    for t in conn.execute("SELECT * FROM termine").fetchall():
+        if ausser == ("termin", t["id"]) or t["ganztaegig"]:
+            continue
+        for tb, te in termin_vorkommen(row_dict(t), tag - timedelta(days=1), ende.date()):
+            if tb < ende and beginn < te:
+                treffer.append({"art": "termin", "id": t["id"], "titel": t["titel"], "beginn": tb.isoformat(timespec="minutes")})
+    return treffer
+
+
+def aufgaben_aus_vorlagen(conn, a):
+    """Beim Anlegen eines Auftrags: die Aufgaben-Vorlagen seines Pakets als Aufgaben anlegen."""
+    d = date.fromisoformat(a["datum"])
+    for v in conn.execute("SELECT * FROM aufgaben_vorlagen WHERE paket_id=? ORDER BY sort, id", (a["paket_id"],)).fetchall():
+        conn.execute("INSERT INTO aufgaben (titel, faellig, prioritaet, status, kunde_id, auftrag_id, sort, erstellt_am, geaendert_am) "
+                     "VALUES (?, ?, ?, 'Offen', ?, ?, ?, ?, ?)",
+                     (v["titel"], (d + timedelta(days=v["tage_offset"] or 0)).isoformat(), v["prioritaet"] or "Mittel",
+                      a["kunde_id"], a["id"], v["sort"] or 0, now_iso(), now_iso()))
 
 
 FRIST_EINHEITEN = ("Tage", "Wochen", "Monate")
@@ -1226,6 +1378,20 @@ def speichern(conn, table, data, old, user, fest=None):
         changes = {k: v for k, v in vals.items() if k not in AUDIT_SKIP and v not in (None, "")}
     if table in ("auftraege", "zahlungen"):
         zahlung_sync(conn, rid if table == "auftraege" else row["auftrag_id"])
+    if table == "aufgaben":
+        if row.get("status") == "Erledigt" and (not old or old["status"] != "Erledigt"):
+            conn.execute("UPDATE aufgaben SET erledigt_am=? WHERE id=?", (now, rid))
+            # wiederkehrend: die nächste Aufgabe entsteht beim Erledigen, die erledigte bleibt als Verlauf
+            nxt = naechstes(date.fromisoformat(row["faellig"]), row.get("wiederholung") or "") if row.get("faellig") else None
+            if nxt:
+                conn.execute("INSERT INTO aufgaben (titel, faellig, prioritaet, status, wiederholung, kunde_id, auftrag_id, notizen, sort, "
+                             "erstellt_am, geaendert_am) VALUES (?, ?, ?, 'Offen', ?, ?, ?, ?, ?, ?, ?)",
+                             (row["titel"], nxt.isoformat(), row.get("prioritaet") or "Mittel", row["wiederholung"], row.get("kunde_id"),
+                              row.get("auftrag_id"), row.get("notizen"), row.get("sort") or 0, now, now))
+        elif row.get("status") != "Erledigt" and old and old["status"] == "Erledigt":
+            conn.execute("UPDATE aufgaben SET erledigt_am=NULL WHERE id=?", (rid,))
+    if table == "auftraege" and not old:
+        aufgaben_aus_vorlagen(conn, {**row, "id": rid})
     if table == "lieferlinks" and not old:   # erster Link: der Auftrag gilt als geliefert
         a = conn.execute("SELECT * FROM auftraege WHERE id=?", (row["auftrag_id"],)).fetchone()
         if a and a["status"] in ("Angefragt", "Bestätigt", "Fotografiert"):
@@ -1240,6 +1406,13 @@ def speichern(conn, table, data, old, user, fest=None):
         mit_ampel(conn, [out])
     if table == "vertraege":
         mit_fristen([out])
+    # Warnung bei Überschneidungen (gespeichert wird trotzdem)
+    if table == "termine" and not out.get("ganztaegig"):
+        b, e = termin_zeit(out)
+        out["ueberschneidungen"] = ueberschneidungen(conn, b, e, ("termin", rid))
+    if table == "auftraege" and out.get("uhrzeit") and out.get("status") != "Abgesagt":
+        b = datetime.fromisoformat(f"{out['datum']}T{out['uhrzeit']}")
+        out["ueberschneidungen"] = ueberschneidungen(conn, b, b + timedelta(minutes=ICS_DAUER_MIN), ("auftrag", rid))
     return out
 
 
@@ -1270,6 +1443,10 @@ def dashboard(conn, tag):
         "vertraege": sorted((v for v in vertraege if v["kuendigen_bis"] and tag <= v["kuendigen_bis"] <= grenze),
                             key=lambda v: v["kuendigen_bis"]),
         "umsatz_jahr": u["summe"], "umsatz_grenze": u["grenze"], "jahr": t.year,
+        "aufgaben": [row_dict(r) for r in conn.execute(
+            "SELECT * FROM aufgaben WHERE status != 'Erledigt' AND faellig != '' AND faellig <= ? ORDER BY faellig, prioritaet='Niedrig', "
+            "prioritaet='Mittel', id", (tag,))],
+        "eigene_termine": [e for e in kalender_eintraege(conn, tag, (t + timedelta(days=14)).isoformat()) if e["art"] == "termin"],
     }
 
 
@@ -1290,7 +1467,194 @@ def kalender_eintraege(conn, von, bis):
     for l in conn.execute("SELECT l.id, l.auftrag_id, l.typ, l.laeuft_ab_am, a.begegnung FROM lieferlinks l JOIN auftraege a ON a.id = l.auftrag_id "
                           "WHERE l.laeuft_ab_am >= ? AND l.laeuft_ab_am <= ?", (von, bis)):
         out.append({"art": "ablauf", "id": l["auftrag_id"], "datum": l["laeuft_ab_am"], "uhrzeit": "", "titel": f"{l['typ']}-Link läuft ab: {l['begegnung'] or ''}"})
+    v_, b_ = date.fromisoformat(von), date.fromisoformat(bis)
+    for t in conn.execute("SELECT * FROM termine").fetchall():
+        for tb, te in termin_vorkommen(row_dict(t), v_, b_):
+            if tb.date() < v_:
+                continue
+            out.append({"art": "termin", "id": t["id"], "datum": tb.date().isoformat(), "uhrzeit": "" if t["ganztaegig"] else tb.strftime("%H:%M"),
+                        "bis": "" if t["ganztaegig"] else te.strftime("%H:%M"), "titel": t["titel"], "ort": t["ort"] or "", "termin_art": t["art"] or ""})
+    for a in conn.execute("SELECT id, titel, faellig, prioritaet FROM aufgaben WHERE status != 'Erledigt' AND faellig >= ? AND faellig <= ?", (von, bis)):
+        out.append({"art": "aufgabe", "id": a["id"], "datum": a["faellig"], "uhrzeit": "", "titel": a["titel"], "prioritaet": a["prioritaet"]})
+    with FREMD_LOCK:
+        fremd = list(FREMD["termine"])
+    for f in fremd:
+        if von <= f["datum"] <= bis:
+            out.append({"art": "extern", "id": 0, **f})
     return sorted(out, key=lambda e: (e["datum"], e["uhrzeit"] or "99"))
+
+
+# ---------------------------------------------------------------------------
+# Fremder Kalender (ICS-Link, zum Beispiel Dienstplan): nur anzeigen, nie ins eigene Kalender-Abo übernehmen.
+# Der Link liegt in secrets ("ics_import_url"), abgerufen wird alle 30 Minuten im Hintergrund.
+# ---------------------------------------------------------------------------
+FREMD_LOCK = threading.Lock()
+FREMD = {"termine": [], "zeit": "", "fehler": ""}
+FREMD_MAX = 5 * 1024 * 1024
+FREMD_TAGE = 400   # Vorkommen von heute minus 30 bis plus 400 Tage
+
+
+def fremd_url_ok(url):
+    """Nur https, kein Server im eigenen Netz (sonst könnte der Link den Server auf interne Adressen schicken)."""
+    u = urlparse(str(url or ""))
+    if u.scheme != "https" or not u.hostname or len(url) > 2000:
+        return False
+    try:
+        for info in socket.getaddrinfo(u.hostname, u.port or 443, proto=socket.IPPROTO_TCP):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def ics_lesen(text, heute_d=None):
+    """Einfacher ICS-Leser für VEVENTs: SUMMARY, LOCATION, DTSTART/DTEND (mit TZID, UTC oder ganztägig), RRULE mit FREQ,
+    INTERVAL, COUNT, UNTIL. shortcut: BYDAY, EXDATE und geänderte Einzeltermine (RECURRENCE-ID) werden nicht ausgewertet;
+    reicht für einfache Dienstpläne, bei Bedarf erweitern."""
+    heute_d = heute_d or date.fromisoformat(heute())
+    von, bis = heute_d - timedelta(days=30), heute_d + timedelta(days=FREMD_TAGE)
+    zeilen = []
+    for z in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if z[:1] in (" ", "\t") and zeilen:
+            zeilen[-1] += z[1:]
+        else:
+            zeilen.append(z)
+
+    def zeit(name, params, wert):
+        tz = next((p.split("=", 1)[1] for p in params if p.upper().startswith("TZID=")), None)
+        if "VALUE=DATE" in [p.upper() for p in params] or re.fullmatch(r"\d{8}", wert):
+            return datetime.strptime(wert[:8], "%Y%m%d"), True
+        dt = datetime.strptime(wert[:15], "%Y%m%dT%H%M%S")
+        if wert.endswith("Z"):
+            return dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(TZ).replace(tzinfo=None), False
+        if tz:
+            try:
+                return dt.replace(tzinfo=ZoneInfo(tz.strip('"'))).astimezone(TZ).replace(tzinfo=None), False
+            except Exception:  # noqa: unbekannte Zeitzone: als Ortszeit nehmen
+                pass
+        return dt, False
+
+    def text_(v):
+        return v.replace("\\n", " ").replace("\\N", " ").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+
+    out, ev = [], None
+    for z in zeilen:
+        if z == "BEGIN:VEVENT":
+            ev = {}
+        elif z == "END:VEVENT" and ev is not None:
+            try:
+                if "DTSTART" in ev and ev.get("STATUS", ("", [], ""))[2].upper() != "CANCELLED":
+                    b, ganz = zeit(*ev["DTSTART"])
+                    e = zeit(*ev["DTEND"])[0] if "DTEND" in ev else b + (timedelta(days=1) if ganz else timedelta(hours=1))
+                    regel = dict(x.split("=", 1) for x in ev.get("RRULE", ("", [], ""))[2].split(";") if "=" in x)
+                    freq = {"DAILY": "täglich", "WEEKLY": "wöchentlich", "MONTHLY": "monatlich", "YEARLY": "jährlich"}.get(regel.get("FREQ", ""), "")
+                    schritt = max(1, int(regel.get("INTERVAL", "1") or 1))
+                    anzahl = int(regel["COUNT"]) if regel.get("COUNT", "").isdigit() else None
+                    ende_r = datetime.strptime(regel["UNTIL"][:8], "%Y%m%d").date() if regel.get("UNTIL") else None
+                    x, n = b, 0
+                    while n < 3000:
+                        if x.date() > bis or (ende_r and x.date() > ende_r) or (anzahl is not None and n >= anzahl):
+                            break
+                        if x.date() >= von:
+                            out.append({"datum": x.date().isoformat(), "uhrzeit": "" if ganz else x.strftime("%H:%M"),
+                                        "bis": "" if ganz else (x + (e - b)).strftime("%H:%M"),
+                                        "titel": text_(ev.get("SUMMARY", ("", [], "Termin"))[2])[:200], "ort": text_(ev.get("LOCATION", ("", [], ""))[2])[:200]})
+                        if not freq:
+                            break
+                        n += 1
+                        if freq in ("monatlich", "jährlich"):
+                            x = datetime.combine(plus_monate(b.date(), n * schritt * (1 if freq == "monatlich" else 12)), b.time())
+                        else:
+                            x = b + n * schritt * timedelta(days=1 if freq == "täglich" else 7)
+            except (ValueError, KeyError):
+                pass   # einzelner kaputter Termin: überspringen, der Rest zählt
+            ev = None
+        elif ev is not None and ":" in z:
+            kopf, wert = z.split(":", 1)
+            name, *params = kopf.split(";")
+            ev[name.upper()] = (name.upper(), params, wert)
+    return out
+
+
+def fremd_abrufen():
+    with db() as conn:
+        url = secret_get(conn, "ics_import_url")
+    if not url:
+        with FREMD_LOCK:
+            FREMD.update(termine=[], zeit="", fehler="")
+        return
+    try:
+        if not fremd_url_ok(url):
+            raise ValueError("Der Link muss mit https:// beginnen und auf einen Server im Internet zeigen.")
+        req = urllib.request.Request(url, headers={"User-Agent": "Studio-Tool/" + VERSION, "Accept": "text/calendar"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read(FREMD_MAX + 1)
+        if len(raw) > FREMD_MAX:
+            raise ValueError("Der Kalender ist größer als 5 MB.")
+        termine = ics_lesen(raw.decode("utf-8", "replace"))
+        with FREMD_LOCK:
+            FREMD.update(termine=termine, zeit=now_iso(), fehler="")
+    except Exception as e:  # noqa: Netz, Format, Zertifikat
+        with FREMD_LOCK:
+            FREMD.update(zeit=now_iso(), fehler=str(e)[:200] or e.__class__.__name__)
+
+
+# ---------------------------------------------------------------------------
+# Hintergrund: Erinnerungen per Push (Termine mit Vorlauf, Aufgaben am Fälligkeitstag um 8 Uhr) und fremder Kalender
+# ---------------------------------------------------------------------------
+AUFGABEN_UHRZEIT = 8
+
+
+def erinnerungen_faellig(conn, jetzt):
+    """Was jetzt erinnert werden soll und noch nicht erinnert wurde: Liste (schluessel, titel, text, url)."""
+    out = []
+    tag = jetzt.date()
+    for t in conn.execute("SELECT * FROM termine WHERE erinnerung_min IS NOT NULL").fetchall():
+        for tb, _ in termin_vorkommen(row_dict(t), tag - timedelta(days=1), tag + timedelta(days=8)):
+            wann = tb - timedelta(minutes=t["erinnerung_min"] or 0)
+            if wann <= jetzt <= tb + timedelta(minutes=10):   # verpasste Erinnerung höchstens bis 10 Minuten nach Beginn nachholen
+                out.append((f"termin:{t['id']}:{tb.isoformat()}", "Termin" + ("" if t["ganztaegig"] else f" um {tb:%H:%M}"),
+                            t["titel"] + (f", {t['ort']}" if t["ort"] else ""), "/#/kalender"))
+    if jetzt.hour >= AUFGABEN_UHRZEIT:
+        for a in conn.execute("SELECT id, titel FROM aufgaben WHERE status != 'Erledigt' AND faellig=?", (tag.isoformat(),)):
+            out.append((f"aufgabe:{a['id']}:{tag.isoformat()}", "Aufgabe fällig", a["titel"], "/#/aufgaben"))
+    return [x for x in out if not conn.execute("SELECT 1 FROM erinnerungen WHERE schluessel=?", (x[0],)).fetchone()]
+
+
+def erinnern(jetzt=None):
+    jetzt = jetzt or datetime.now(TZ).replace(tzinfo=None)
+    with db() as conn:
+        faellig = erinnerungen_faellig(conn, jetzt)
+        for schluessel, *_ in faellig:   # vor dem Senden merken: lieber einmal verpasst als doppelt
+            conn.execute("INSERT OR IGNORE INTO erinnerungen (schluessel, zeit) VALUES (?, ?)", (schluessel, jetzt.isoformat()))
+        conn.execute("DELETE FROM erinnerungen WHERE zeit < ?", ((jetzt - timedelta(days=60)).isoformat(),))
+    for schluessel, titel, text, url in faellig:
+        send_push(titel, text, url, schluessel.rsplit(":", 1)[0])
+    return len(faellig)
+
+
+def hintergrund_loop():
+    letzter_abruf = 0
+    while True:
+        try:
+            erinnern()
+        except Exception as e:  # noqa
+            print("Erinnerungen fehlgeschlagen:", e)
+        if time.time() - letzter_abruf > 1800:
+            letzter_abruf = time.time()
+            fremd_abrufen()
+        if HINTERGRUND_EXTRA:
+            for f in HINTERGRUND_EXTRA:
+                try:
+                    f()
+                except Exception as e:  # noqa
+                    print("Hintergrund fehlgeschlagen:", e)
+        threading.Event().wait(60)
+
+
+HINTERGRUND_EXTRA = []   # weitere Aufgaben je Minute (Postfach-Abruf, Phase 9)
 
 
 def ics_text(v):
@@ -1334,6 +1698,20 @@ def ics_kalender(conn):
         if a["ort"]:
             z.append("LOCATION:" + ics_text(a["ort"]))
         z.append("END:VEVENT")
+    # eigene Termine, Wiederholungen als einzelne Vorkommen im nächsten Jahr
+    h = date.fromisoformat(heute())
+    for t in conn.execute("SELECT * FROM termine").fetchall():
+        for tb, te in termin_vorkommen(row_dict(t), h - timedelta(days=90), h + timedelta(days=365)):
+            z += ["BEGIN:VEVENT", f"UID:termin-{t['id']}-{tb:%Y%m%dT%H%M}@{host}", f"DTSTAMP:{stamp}"]
+            if t["ganztaegig"]:
+                z += [f"DTSTART;VALUE=DATE:{tb:%Y%m%d}", f"DTEND;VALUE=DATE:{te:%Y%m%d}"]
+            else:
+                u = ZoneInfo("UTC")
+                z += [f"DTSTART:{tb.replace(tzinfo=TZ).astimezone(u):%Y%m%dT%H%M%SZ}", f"DTEND:{te.replace(tzinfo=TZ).astimezone(u):%Y%m%dT%H%M%SZ}"]
+            z.append("SUMMARY:" + ics_text(t["titel"]))
+            if t["ort"]:
+                z.append("LOCATION:" + ics_text(t["ort"]))
+            z.append("END:VEVENT")
     z.append("END:VCALENDAR")
     return "\r\n".join(ics_falten(x) for x in z) + "\r\n"
 
@@ -1815,6 +2193,8 @@ class Handler(BaseHTTPRequestHandler):
                     set_setting(conn, "ics_token_hash", "")
                     audit(conn, user, "Kalender-Abo abgeschaltet", "settings", None, "Kalender-Abo")
                 return self.send_json({"aktiv": bool(get_setting(conn, "ics_token_hash"))})
+        if p[:2] == ["kalender", "fremd"]:
+            return self.api_fremd(method, p[2:], user)
         if method == "POST" and p == ["auftraege", "serie"]:
             with db() as conn:
                 return self.send_json(serie_anlegen(conn, self.read_json(), user), 201)
@@ -1883,11 +2263,17 @@ class Handler(BaseHTTPRequestHandler):
                 # (IntegrityError, siehe handle_request) und alles wird zurückgerollt.
                 if table == "kunden":
                     conn.execute("DELETE FROM kontakte WHERE kunde_id=?", (rid,))
+                    conn.execute("UPDATE aufgaben SET kunde_id=NULL WHERE kunde_id=?", (rid,))
+                    conn.execute("UPDATE termine SET kunde_id=NULL WHERE kunde_id=?", (rid,))
+                if table == "pakete":
+                    conn.execute("DELETE FROM aufgaben_vorlagen WHERE paket_id=?", (rid,))
                 if table == "auftraege":   # nur, solange keine Zahlung erfasst ist: die offenen Zahlungen gehen mit
                     if conn.execute("SELECT 1 FROM zahlungen WHERE auftrag_id=? AND (status != 'Offen' OR IFNULL(finom_abgerechnet, 0))",
                                     (rid,)).fetchone():
                         raise BadRequest("Zu diesem Auftrag ist schon eine Zahlung erfasst. Bitte archivieren statt löschen.")
                     conn.execute("DELETE FROM zahlungen WHERE auftrag_id=?", (rid,))
+                    conn.execute("DELETE FROM aufgaben WHERE auftrag_id=?", (rid,))   # die Aufgaben gehören zum Auftrag
+                    conn.execute("UPDATE termine SET auftrag_id=NULL WHERE auftrag_id=?", (rid,))
                 if table == "zahlungen":
                     if old["art"] != "Anzahlung":
                         raise BadRequest("Die Zahlung gehört zum Auftrag und lässt sich nicht einzeln löschen.")
@@ -1902,6 +2288,33 @@ class Handler(BaseHTTPRequestHandler):
                       {k: v for k, v in row_dict(old).items() if k not in AUDIT_SKIP and v not in (None, "")})
                 return self.send_json({"ok": True})
         return self.send_json({"error": "Methode nicht erlaubt"}, 405)
+
+    # -- Fremder Kalender (/api/kalender/fremd) -----------------------------
+    def api_fremd(self, method, p, user):
+        if method == "POST" and p == ["abrufen"]:
+            fremd_abrufen()
+        elif method == "PUT" and not p:
+            url = str(self.read_json().get("url") or "").strip()
+            if url.startswith("webcal://"):
+                url = "https://" + url[len("webcal://"):]
+            if not fremd_url_ok(url):
+                raise BadRequest("Der Link muss mit https:// (oder webcal://) beginnen und auf einen Server im Internet zeigen.")
+            with db() as conn:
+                secret_set(conn, "ics_import_url", url)
+                audit(conn, user, "Fremden Kalender eingetragen", "settings", None, urlparse(url).hostname or "")
+            fremd_abrufen()
+        elif method == "DELETE" and not p:
+            with db() as conn:
+                secret_set(conn, "ics_import_url", "")
+                audit(conn, user, "Fremden Kalender entfernt", "settings", None, "")
+            fremd_abrufen()
+        elif method != "GET" or p:
+            return self.send_json({"error": "Unbekannte Schnittstelle"}, 404)
+        with db() as conn:
+            url = secret_get(conn, "ics_import_url")
+        with FREMD_LOCK:   # der Link selbst wird nie ausgegeben, nur der Servername
+            return self.send_json({"aktiv": bool(url), "host": urlparse(url).hostname if url else "", "zeit": FREMD["zeit"],
+                                   "fehler": FREMD["fehler"], "anzahl": len(FREMD["termine"])})
 
     # -- Push-Abos dieses Geräts (/api/push/...) ---------------------------
     def api_push(self, method, p):
@@ -2120,6 +2533,7 @@ def main():
         return cli()
     httpd = make_server()
     threading.Thread(target=backup_loop, daemon=True).start()
+    threading.Thread(target=hintergrund_loop, daemon=True).start()
     print("=" * 56)
     print(f"  {APP_NAME} {VERSION}")
     print(f"  Läuft unter http://{'127.0.0.1' if HOST in ('0.0.0.0', '::') else HOST}:{PORT}/")

@@ -83,7 +83,8 @@ function editRecord(table, title, fields, rec = {}, opts = {}) {
       } catch (e) {   // der Eintrag ist schon gespeichert: Dialog schließen, sonst legt ein zweiter Versuch ihn doppelt an
         return fertig('Gespeichert, aber ohne Datei: ' + e.message, 'save', r);
       }
-      fertig('Gespeichert', 'save', r);
+      const ue = (r && r.ueberschneidungen) || [];
+      fertig(ue.length ? 'Gespeichert. Achtung, zur selben Zeit: ' + ue.map(x => x.titel).join(', ') : 'Gespeichert', 'save', r);
     } catch (e) { toast(e.message); }
   });
   form.addEventListener('click', async (ev) => {
@@ -259,6 +260,7 @@ App.pages.auftrag = async (view, id) => {
     [api('auftraege/' + Number(id)), api('auftraege'), api('kunden'), api('pakete'), api('kontakte'), api('zahlungen'),
       api('lieferlinks'), api('vorlagen')]);
   const links = alleLinks.filter(l => l.auftrag_id === a.id);
+  const aufgaben = (await api('aufgaben')).filter(x => x.auftrag_id === a.id);
   const zs = alleZahlungen.filter(z => z.auftrag_id === a.id);
   const zSumme = zs.reduce((sum, z) => sum + z.betrag_cent, 0);
   const kunde = byId(kunden, a.kunde_id) || {};
@@ -295,8 +297,12 @@ App.pages.auftrag = async (view, id) => {
         ${zs.some(z => z.art === 'Anzahlung') ? '' : '<button type="button" class="btn sm" id="anzNeu">Anzahlung hinzufügen</button>'}</div>
       <div class="card"><h2>Bilder</h2><div id="lListe">${links.map(linkZeile).join('') || '<p class="muted">Noch kein Galerie-Link.</p>'}</div>
         <button type="button" class="btn sm" id="lNeu">Link hinzufügen</button></div>
+      <div class="card"><h2>Aufgaben</h2><div id="tListe">${aufgabenListe(aufgaben)}</div>
+        <button type="button" class="btn sm" id="tNeu">Aufgabe hinzufügen</button></div>
     </div>`;
   const d = { auftraege, kunden, pakete };
+  aufgabenBinden($('#tListe'), aufgaben, kunden, auftraege);
+  $('#tNeu').addEventListener('click', () => aufgabeDialog({ auftrag_id: a.id, kunde_id: a.kunde_id }, kunden, auftraege));
   $('#aEdit').addEventListener('click', () => auftragDialog(a, d, { danach: (was) => { if (was === 'del') location.hash = '#/auftraege'; else router(); } }));
   // Kopie ohne Datum, Status und Betrag: die Preise kommen neu aus dem Paket
   $('#aDup').addEventListener('click', () => auftragDialog(
@@ -567,8 +573,10 @@ App.pages.einstellungen = async (view) => {
           Die Kopien liegen auf demselben Rechner wie das Tool, die Ablage außerhalb folgt in Phase 6.</p>
         <button type="button" class="btn sm" id="sichNeu">Jetzt sichern</button></div>
       <div class="card" id="pushCard"></div>
+      <div class="card" id="avCard"></div>
     </div>`;
   pushKarte($('#pushCard'));
+  vorlagenKarte($('#avCard'), pakete);
   $('#sichNeu').addEventListener('click', async () => {
     try { await api('sicherungen', 'POST', {}); toast('Sicherung erstellt'); router(); } catch (e) { toast(e.message); }
   });
@@ -707,8 +715,12 @@ App.pages.start = async (view) => {
   const anteil = d.umsatz_grenze ? Math.round(d.umsatz_jahr / d.umsatz_grenze * 100) : null;
   view.innerHTML = head('Hallo ' + (App.me.display_name || App.me.username), 'Heute ist der ' + datum(d.heute))
     + `<div class="grid g2">
-      <div class="card"><h2>Nächste 14 Tage</h2>${liste(d.termine, a => `<tr><td class="nowrap">${ampelPunkt(a)}${datum(a.datum)}${a.uhrzeit ? `<br><span class="muted small">${esc(a.uhrzeit)} Uhr</span>` : ''}</td>
+      <div class="card"><h2>Nächste 14 Tage</h2>${liste([...d.termine, ...d.eigene_termine].sort((x, y) => (x.datum + (x.uhrzeit || '99')).localeCompare(y.datum + (y.uhrzeit || '99'))),
+        a => a.art === 'termin' ? `<tr><td class="nowrap">${datum(a.datum)}${a.uhrzeit ? `<br><span class="muted small">${esc(a.uhrzeit)} Uhr</span>` : ''}</td>
+          <td><a class="linkbtn" href="#/kalender/termin/${a.id}"><b>${esc(a.titel)}</b></a><br><span class="muted small">${esc(a.ort || '')}</span></td><td><span class="kal-chip termin">Termin</span></td></tr>`
+        : `<tr><td class="nowrap">${ampelPunkt(a)}${datum(a.datum)}${a.uhrzeit ? `<br><span class="muted small">${esc(a.uhrzeit)} Uhr</span>` : ''}</td>
         <td>${auftragLink(a)}<br><span class="muted small">${esc([a.kunde, a.ort].filter(Boolean).join(' · '))}</span></td><td>${esc(a.status)}</td></tr>`, 'Keine Termine in den nächsten 14 Tagen.')}</div>
+      <div class="card"><h2>Aufgaben heute und überfällig</h2><div id="startAufgaben">${aufgabenListe(d.aufgaben, true)}</div></div>
       <div class="card"><h2>Überfällige Lieferungen</h2>${liste(d.ueberfaellig, a => `<tr><td class="nowrap">${ampelPunkt(a)}${datum(a.datum)}</td>
         <td>${auftragLink(a)}<br><span class="muted small">${esc(a.kunde)}</span></td><td class="num">Frist ${datum(a.lieferfrist)}</td></tr>`, 'Nichts überfällig.')}</div>
       <div class="card"><h2>Offene Zahlungen: ${euro(d.offen_summe)}</h2>${liste(d.offen.slice(0, 6), z => `<tr><td class="nowrap">${datum(z.datum)}</td>
@@ -723,70 +735,137 @@ App.pages.start = async (view) => {
         <span class="muted small">${esc(v.art)}</span></td><td class="num">${fristBadge(v)}</td></tr>`, 'Keine Kündigungsfrist in den nächsten 60 Tagen.')}</div>
     </div>`;
   $$('.balken span', view).forEach(el => { el.style.width = Math.min(100, anteil) + '%'; });
+  aufgabenBinden($('#startAufgaben'), d.aufgaben, [], []);
 };
 
 /* ---------- Kalender ---------- */
-const KAL_ARTEN = { auftrag: 'Aufträge', lieferfrist: 'Lieferfristen', vertrag: 'Vertragsfristen', ablauf: 'Link-Abläufe' };
+const KAL_ARTEN = { auftrag: 'Aufträge', termin: 'Termine', aufgabe: 'Aufgaben', lieferfrist: 'Lieferfristen', vertrag: 'Vertragsfristen',
+  ablauf: 'Link-Abläufe', extern: 'Fremder Kalender' };
 const kalLink = e => e.art === 'vertrag' ? '#/vertraege' : e.art === 'aufgabe' ? '#/aufgaben' : e.art === 'termin' ? `#/kalender/termin/${e.id}`
   : e.art === 'extern' ? '' : `#/auftrag/${e.id}`;
 function kalChip(e) {
-  const txt = `${e.uhrzeit ? esc(e.uhrzeit) + ' ' : ''}${esc(e.titel)}`;
+  const txt = `${e.uhrzeit ? esc(e.uhrzeit) + (e.bis ? ' bis ' + esc(e.bis) : '') + ' ' : ''}${esc(e.titel)}${e.ort && e.art !== 'auftrag' ? ', ' + esc(e.ort) : ''}`;
   const href = kalLink(e);
   return href ? `<a class="kal-chip ${e.art}${e.status === 'Abgesagt' ? ' abgesagt' : ''}" href="${href}">${txt}</a>` : `<span class="kal-chip ${e.art}">${txt}</span>`;
 }
+const TERMIN_ARTEN = ['Besprechung', 'Shooting-Vorbereitung', 'Privat geblockt', 'Sonstiges'];
+const ERINNERUNGEN = [['', 'keine'], ['0', 'zu Beginn'], ['15', '15 Minuten vorher'], ['30', '30 Minuten vorher'], ['60', '1 Stunde vorher'],
+  ['120', '2 Stunden vorher'], ['1440', '1 Tag vorher']];
+const WIEDERHOLUNG_OPT = [['', 'keine'], ['täglich', 'täglich'], ['wöchentlich', 'wöchentlich'], ['monatlich', 'monatlich'], ['jährlich', 'jährlich']];
+
+function terminDialog(t, kunden, danach) {
+  const felder = [
+    { key: 'titel', label: 'Titel', required: true, full: true },
+    { key: 'tag', label: 'Datum', type: 'date', required: true },
+    { key: 'ganztaegig', label: 'Ganztägig', type: 'check' },
+    { key: 'von', label: 'Von', type: 'time' },
+    { key: 'bis', label: 'Bis', type: 'time' },
+    { key: 'ort', label: 'Ort' },
+    { key: 'art', label: 'Art', type: 'select', options: [['', 'ohne']].concat(TERMIN_ARTEN.map(x => [x, x])) },
+    { key: 'wiederholung', label: 'Wiederholung', type: 'select', options: WIEDERHOLUNG_OPT },
+    { key: 'wiederholung_bis', label: 'Wiederholen bis (leer: ohne Ende)', type: 'date' },
+    { key: 'erinnerung_min', label: 'Erinnerung per Push', type: 'select', options: ERINNERUNGEN },
+    { key: 'kunde_id', label: 'Kunde (optional)', type: 'select', options: [['', 'ohne']].concat(kunden.filter(k => !k.archiviert || k.id === t.kunde_id).map(k => [k.id, k.name])) },
+    { key: 'notizen', label: 'Notizen', type: 'textarea', full: true },
+  ];
+  const rec = { ...t, tag: (t.beginn || '').slice(0, 10), von: (t.beginn || '').slice(11, 16), bis: (t.ende || '').slice(11, 16),
+    erinnerung_min: t.erinnerung_min ?? '' };
+  editRecord('termine', t.id ? 'Termin bearbeiten' : 'Termin anlegen', felder, rec, {
+    umwandeln: (d) => {
+      const { tag, von, bis, ...rest } = d;
+      if (!d.ganztaegig && !von) throw new Error('Bitte eine Uhrzeit angeben oder "Ganztägig" wählen.');
+      return { ...rest, beginn: d.ganztaegig ? tag : `${tag}T${von}`, ende: d.ganztaegig ? '' : (bis ? `${tag}T${bis}` : '') };
+    },
+    danach: danach || (() => { location.hash = '#/kalender'; }),
+  });
+}
 
 App.pages.kalender = async (view, ...rest) => {
-  if (rest[0] === 'termin' && App.terminDialog) return App.terminDialog(view, rest[1]);
   if (!Filter.kArten) Filter.kArten = Object.keys(KAL_ARTEN);
-  if (!Filter.kAnsicht) Filter.kAnsicht = matchMedia('(max-width: 700px)').matches ? 'agenda' : 'monat';
-  const monat = Filter.kMonat || isoTag(new Date()).slice(0, 7);
-  const [y, mo] = monat.split('-').map(Number);
-  const erster = new Date(y, mo - 1, 1), letzter = new Date(y, mo, 0);
-  const start = new Date(y, mo - 1, 1 - (erster.getDay() + 6) % 7);
-  const ende = new Date(y, mo - 1, letzter.getDate() + 6 - (letzter.getDay() + 6) % 7);
-  const [alle, abo] = await Promise.all([api(`kalender?von=${isoTag(start)}&bis=${isoTag(ende)}`), api('kalender/abo')]);
-  const eintraege = alle.filter(e => Filter.kArten.includes(e.art) || !(e.art in KAL_ARTEN));
+  if (!Filter.kAnsicht) Filter.kAnsicht = matchMedia('(max-width: 700px)').matches ? 'liste' : 'monat';
+  const t0 = new Date((Filter.kDatum || isoTag(new Date())) + 'T12:00');
+  const y = t0.getFullYear(), mo = t0.getMonth() + 1;
+  let start, ende, titel;
+  if (Filter.kAnsicht === 'woche') {
+    start = new Date(t0); start.setDate(t0.getDate() - (t0.getDay() + 6) % 7);
+    ende = new Date(start); ende.setDate(start.getDate() + 6);
+    titel = `Woche vom ${datum(isoTag(start))} bis ${datum(isoTag(ende))}`;
+  } else if (Filter.kAnsicht === 'tag') {
+    start = new Date(t0); ende = new Date(t0);
+    titel = `${WOCHENTAGE[(t0.getDay() + 6) % 7]}, ${datum(isoTag(t0))}`;
+  } else {
+    const erster = new Date(y, mo - 1, 1), letzter = new Date(y, mo, 0);
+    start = Filter.kAnsicht === 'monat' ? new Date(y, mo - 1, 1 - (erster.getDay() + 6) % 7) : erster;
+    ende = Filter.kAnsicht === 'monat' ? new Date(y, mo - 1, letzter.getDate() + 6 - (letzter.getDay() + 6) % 7) : letzter;
+    titel = `${MONATSNAMEN[mo - 1]} ${y}`;
+  }
+  const [alle, abo, fremd, kunden] = await Promise.all([api(`kalender?von=${isoTag(start)}&bis=${isoTag(ende)}`), api('kalender/abo'),
+    api('kalender/fremd'), api('kunden')]);
+  const eintraege = alle.filter(e => Filter.kArten.includes(e.art));
   const amTag = {};
   eintraege.forEach(e => (amTag[e.datum] = amTag[e.datum] || []).push(e));
   const heute = isoTag(new Date());
+  const tagesListe = t => { const d = new Date(t + 'T12:00'); return `<div class="kal-agenda${t === heute ? ' heute' : ''}">
+    <div class="kal-datum"><b>${WOCHENTAGE[(d.getDay() + 6) % 7]}, ${datum(t)}</b> <button type="button" class="linkbtn small muted" data-neu="${t}">+ Termin</button></div>
+    ${(amTag[t] || []).map(kalChip).join('') || '<span class="muted small">frei</span>'}</div>`; };
 
   let inhalt;
   if (Filter.kAnsicht === 'monat') {
     let zellen = '';
     for (let d = new Date(start); d <= ende; d.setDate(d.getDate() + 1)) {
       const t = isoTag(d);
-      zellen += `<div class="kal-tag${d.getMonth() !== mo - 1 ? ' fremd' : ''}${t === heute ? ' heute' : ''}"><span class="kal-nr">${d.getDate()}</span>
-        ${(amTag[t] || []).map(kalChip).join('')}</div>`;
+      zellen += `<div class="kal-tag${d.getMonth() !== mo - 1 ? ' fremd' : ''}${t === heute ? ' heute' : ''}">
+        <button type="button" class="kal-nr linkbtn" data-tag="${t}" aria-label="${datum(t)} anzeigen">${d.getDate()}</button>${(amTag[t] || []).map(kalChip).join('')}</div>`;
     }
     inhalt = `<div class="kal-monat">${WOCHENTAGE.map(w => `<div class="kal-kopf">${w}</div>`).join('')}${zellen}</div>`;
+  } else if (Filter.kAnsicht === 'woche' || Filter.kAnsicht === 'tag') {
+    const tage = [];
+    for (let d = new Date(start); d <= ende; d.setDate(d.getDate() + 1)) tage.push(isoTag(d));
+    inhalt = `<div class="kal-woche">${tage.map(tagesListe).join('')}</div>`;
   } else {
-    const tage = Object.keys(amTag).filter(t => t.slice(0, 7) === monat).sort();
-    inhalt = tage.length ? tage.map(t => { const d = new Date(t + 'T12:00'); return `<div class="kal-agenda${t === heute ? ' heute' : ''}">
-      <div class="kal-datum"><b>${WOCHENTAGE[(d.getDay() + 6) % 7]}, ${datum(t)}</b></div>${amTag[t].map(kalChip).join('')}</div>`; }).join('')
-      : '<p class="muted">In diesem Monat steht nichts an.</p>';
+    const tage = Object.keys(amTag).sort();
+    inhalt = tage.length ? tage.map(tagesListe).join('') : '<p class="muted">In diesem Monat steht nichts an.</p>';
   }
 
-  view.innerHTML = head('Kalender', `${MONATSNAMEN[mo - 1]} ${y}`)
-    + `<div class="toolbar"><button class="btn sm" data-monat="-1" aria-label="Voriger Monat">‹</button><button class="btn sm" data-monat="0">Heute</button>
-      <button class="btn sm" data-monat="1" aria-label="Nächster Monat">›</button>
-      <select class="input sm" id="kAnsicht" aria-label="Ansicht"><option value="monat"${Filter.kAnsicht === 'monat' ? ' selected' : ''}>Monat</option>
-        <option value="agenda"${Filter.kAnsicht === 'agenda' ? ' selected' : ''}>Liste</option></select>
-      ${Object.entries(KAL_ARTEN).map(([k, t]) => `<label class="check"><input type="checkbox" data-art="${k}"${Filter.kArten.includes(k) ? ' checked' : ''}> <span class="kal-chip ${k}">${t}</span></label>`).join('')}
-      <span id="kalExtra"></span></div>
+  view.innerHTML = head('Kalender', titel)
+    + `<div class="toolbar"><button class="btn sm" data-schritt="-1" aria-label="Zurück">‹</button><button class="btn sm" data-schritt="0">Heute</button>
+      <button class="btn sm" data-schritt="1" aria-label="Weiter">›</button>
+      <select class="input sm" id="kAnsicht" aria-label="Ansicht">${[['monat', 'Monat'], ['woche', 'Woche'], ['tag', 'Tag'], ['liste', 'Liste']].map(([k, t]) =>
+        `<option value="${k}"${Filter.kAnsicht === k ? ' selected' : ''}>${t}</option>`).join('')}</select>
+      <button class="btn sm primary" id="tNeuKal">Termin anlegen</button></div>
+    <div class="toolbar kal-filter">${Object.entries(KAL_ARTEN).map(([k, t]) => `<label class="check"><input type="checkbox" data-art="${k}"${Filter.kArten.includes(k) ? ' checked' : ''}> <span class="kal-chip ${k}">${t}</span></label>`).join('')}</div>
     <div class="card" id="kalInhalt">${inhalt}</div>
+    <div class="grid g2 kal-unten">
     <div class="card" id="aboCard"><h2>Kalender-Abo fürs iPhone</h2>
       <p class="muted small">Ein geheimer Link, den der iPhone-Kalender regelmäßig abruft: Einstellungen, Kalender, Accounts, Account hinzufügen, Andere,
-        Kalenderabo hinzufügen. Er zeigt nur Termin, Ort und Begegnung, keine Beträge und keine Kontaktdaten. Das klappt erst, wenn das Tool auf dem Server läuft.</p>
+        Kalenderabo hinzufügen. Er zeigt Aufträge und eigene Termine, nur Zeit, Ort und Titel, keine Beträge und keine Kontaktdaten. Klappt erst auf dem Server.</p>
       <p>${abo.aktiv ? '<span class="badge ok">eingerichtet</span>' : '<span class="badge plain">nicht eingerichtet</span>'}</p>
       <div id="aboLink"></div>
       <div class="btn-row"><button type="button" class="btn sm" id="aboNeu">${abo.aktiv ? 'Neuen Link erstellen (alter gilt dann nicht mehr)' : 'Link erstellen'}</button>
-        ${abo.aktiv ? '<button type="button" class="btn sm danger" id="aboAus">Abschalten</button>' : ''}</div></div>`;
+        ${abo.aktiv ? '<button type="button" class="btn sm danger" id="aboAus">Abschalten</button>' : ''}</div></div>
+    <div class="card" id="fremdCard"><h2>Fremder Kalender einblenden</h2>
+      <p class="muted small">ICS-Link eines anderen Kalenders, zum Beispiel Dienstplan oder privater Kalender. Die Termine erscheinen nur hier im Kalender,
+        nie im Kalender-Abo. Abgerufen wird alle 30 Minuten. Der Link wird geschützt gespeichert und nicht wieder angezeigt.</p>
+      ${fremd.aktiv ? `<p><span class="badge ${fremd.fehler ? 'bad' : 'ok'}">${fremd.fehler ? 'Fehler beim Abruf' : 'eingebunden'}</span> ${esc(fremd.host)}
+        ${fremd.zeit ? `<br><span class="muted small">Zuletzt abgerufen ${datum(fremd.zeit)}, ${esc(fremd.zeit.slice(11, 16))} Uhr, ${fremd.anzahl} Termine.</span>` : ''}
+        ${fremd.fehler ? `<br><span class="small">${esc(fremd.fehler)}</span>` : ''}</p>` : ''}
+      <form class="btn-row" id="fremdForm"><input class="input" type="url" name="url" placeholder="https:// oder webcal://" aria-label="ICS-Link" required>
+        <button class="btn sm primary">${fremd.aktiv ? 'Ersetzen' : 'Einbinden'}</button></form>
+      ${fremd.aktiv ? '<div class="btn-row"><button type="button" class="btn sm" id="fremdAbruf">Jetzt abrufen</button><button type="button" class="btn sm danger" id="fremdAus">Entfernen</button></div>' : ''}</div>
+    </div>`;
 
+  const schieben = n => {
+    const d = new Date(t0);
+    if (n === 0) return isoTag(new Date());
+    if (Filter.kAnsicht === 'woche') d.setDate(d.getDate() + 7 * n);
+    else if (Filter.kAnsicht === 'tag') d.setDate(d.getDate() + n);
+    else { d.setDate(1); d.setMonth(d.getMonth() + n); }
+    return isoTag(d);
+  };
   $('.toolbar', view).addEventListener('click', (ev) => {
-    const m = ev.target.closest('button')?.dataset.monat;
-    if (m === undefined) return;
-    const d = m === '0' ? new Date() : new Date(y, mo - 1 + Number(m), 1);
-    Filter.kMonat = isoTag(d).slice(0, 7);
+    const n = ev.target.closest('button')?.dataset.schritt;
+    if (n === undefined) return;
+    Filter.kDatum = schieben(Number(n));
     router();
   });
   $('#kAnsicht').addEventListener('change', (ev) => { Filter.kAnsicht = ev.target.value; router(); });
@@ -794,6 +873,12 @@ App.pages.kalender = async (view, ...rest) => {
     Filter.kArten = $$('[data-art]', view).filter(x => x.checked).map(x => x.dataset.art);
     router();
   }));
+  $('#kalInhalt').addEventListener('click', (ev) => {
+    const b = ev.target.closest('button')?.dataset || {};
+    if (b.tag) { Filter.kDatum = b.tag; Filter.kAnsicht = 'tag'; router(); }
+    if (b.neu) terminDialog({ beginn: b.neu }, kunden, () => router());
+  });
+  $('#tNeuKal').addEventListener('click', () => terminDialog({ beginn: Filter.kAnsicht === 'tag' ? isoTag(t0) : isoTag(new Date()) }, kunden, () => router()));
   $('#aboNeu').addEventListener('click', async () => {
     if (abo.aktiv && !confirm('Neuen Link erstellen? Der bisherige Link funktioniert danach nicht mehr.')) return;
     try {
@@ -809,8 +894,116 @@ App.pages.kalender = async (view, ...rest) => {
     if (!confirm('Kalender-Abo abschalten? Der iPhone-Kalender bekommt danach keine Termine mehr.')) return;
     try { await api('kalender/abo', 'DELETE'); toast('Abgeschaltet'); router(); } catch (e) { toast(e.message); }
   });
-  if (App.kalenderExtra) App.kalenderExtra(view, { y, mo, start, ende });
+  $('#fremdForm').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    try { const r = await api('kalender/fremd', 'PUT', { url: ev.target.elements.url.value.trim() }); toast(r.fehler ? 'Gespeichert, aber: ' + r.fehler : `${r.anzahl} Termine eingelesen`); router(); }
+    catch (e) { toast(e.message); }
+  });
+  $('#fremdAbruf')?.addEventListener('click', async () => { const r = await api('kalender/fremd/abrufen', 'POST', {}); toast(r.fehler || `${r.anzahl} Termine eingelesen`); router(); });
+  $('#fremdAus')?.addEventListener('click', async () => {
+    if (!confirm('Fremden Kalender entfernen?')) return;
+    await api('kalender/fremd', 'DELETE'); toast('Entfernt'); router();
+  });
+  if (rest[0] === 'termin' && rest[1]) {   // #/kalender/termin/<id>: Termin direkt bearbeiten
+    try { terminDialog(await api('termine/' + Number(rest[1])), kunden); } catch (e) { toast(e.message); }
+  }
 };
+
+/* ---------- Aufgaben ---------- */
+const PRIO_KLASSE = { Hoch: 'bad', Mittel: 'plain', Niedrig: 'plain' };
+function aufgabenListe(liste, kurz) {
+  if (!liste.length) return '<p class="muted">Keine Aufgaben.</p>';
+  const heute = isoTag(new Date());
+  return `<ul class="aufgaben">${liste.map(x => `<li class="${x.status === 'Erledigt' ? 'erledigt' : ''}">
+    <input type="checkbox" data-erledigt="${x.id}" aria-label="${esc(x.titel)} erledigt"${x.status === 'Erledigt' ? ' checked' : ''}>
+    <div><button type="button" class="linkbtn" data-aufgabe="${x.id}"><b>${esc(x.titel)}</b></button>
+      ${x.prioritaet === 'Hoch' ? `<span class="badge ${PRIO_KLASSE.Hoch}">hoch</span>` : ''}${x.status === 'In Arbeit' ? '<span class="badge warn">in Arbeit</span>' : ''}
+      ${x.wiederholung ? `<span class="muted small">(${esc(x.wiederholung)})</span>` : ''}
+      <br><span class="small ${x.faellig && x.faellig < heute && x.status !== 'Erledigt' ? 'rot' : 'muted'}">${x.faellig ? 'fällig ' + datum(x.faellig) : 'ohne Datum'}</span>
+      ${!kurz && x.auftrag_id ? ` <a class="small" href="#/auftrag/${x.auftrag_id}">zum Auftrag</a>` : ''}</div></li>`).join('')}</ul>`;
+}
+function aufgabenBinden(box, liste, kunden, auftraege) {
+  box.addEventListener('change', async (ev) => {
+    const id = ev.target.dataset.erledigt;
+    if (!id) return;
+    try {
+      await api('aufgaben/' + id, 'PUT', { status: ev.target.checked ? 'Erledigt' : 'Offen' });
+      toast(ev.target.checked ? 'Erledigt' : 'Wieder offen');
+      ev.target.closest('li').classList.toggle('erledigt', ev.target.checked);
+      badgeSync();
+    } catch (e) { toast(e.message); ev.target.checked = !ev.target.checked; }
+  });
+  box.addEventListener('click', async (ev) => {
+    const id = ev.target.closest('button')?.dataset.aufgabe;
+    if (!id) return;
+    const [k, a] = kunden.length ? [kunden, auftraege] : await Promise.all([api('kunden'), api('auftraege')]);
+    aufgabeDialog(byId(liste, id), k, a);
+  });
+}
+function aufgabeDialog(x, kunden, auftraege) {
+  const felder = [
+    { key: 'titel', label: 'Titel', required: true, full: true },
+    { key: 'faellig', label: 'Fällig am', type: 'date' },
+    { key: 'prioritaet', label: 'Priorität', type: 'select', options: [['Mittel', 'Mittel'], ['Hoch', 'Hoch'], ['Niedrig', 'Niedrig']] },
+    { key: 'status', label: 'Status', type: 'select', options: [['Offen', 'Offen'], ['In Arbeit', 'In Arbeit'], ['Erledigt', 'Erledigt']] },
+    { key: 'wiederholung', label: 'Wiederholen (neue Aufgabe beim Erledigen)', type: 'select', options: WIEDERHOLUNG_OPT },
+    { key: 'kunde_id', label: 'Kunde', type: 'select', options: [['', 'ohne']].concat(kunden.filter(k => !k.archiviert || k.id === x.kunde_id).map(k => [k.id, k.name])) },
+    { key: 'auftrag_id', label: 'Auftrag', type: 'select', options: [['', 'ohne']].concat(auftraege.filter(a => !a.archiviert || a.id === x.auftrag_id).slice(-200)
+      .map(a => [a.id, `${datum(a.datum)} ${a.begegnung || ''}`])) },
+    { key: 'notizen', label: 'Notizen', type: 'textarea', full: true },
+  ];
+  editRecord('aufgaben', x.id ? 'Aufgabe bearbeiten' : 'Aufgabe anlegen', felder, x, { danach: () => { badgeSync(); router(); } });
+}
+
+App.pages.aufgaben = async (view) => {
+  const [alle, kunden, auftraege] = await Promise.all([api('aufgaben'), api('kunden'), api('auftraege')]);
+  const heute = isoTag(new Date());
+  const w = new Date(); w.setDate(w.getDate() + 6 - (w.getDay() + 6) % 7);
+  const sonntag = isoTag(w);
+  const offen = alle.filter(x => x.status !== 'Erledigt');
+  const ANSICHTEN = {
+    heute: ['Heute', offen.filter(x => x.faellig && x.faellig <= heute)],
+    woche: ['Diese Woche', offen.filter(x => x.faellig && x.faellig <= sonntag)],
+    ueberfaellig: ['Überfällig', offen.filter(x => x.faellig && x.faellig < heute)],
+    alle: ['Alle offenen', offen],
+    erledigt: ['Erledigt', alle.filter(x => x.status === 'Erledigt').sort((a, b) => (b.erledigt_am || '').localeCompare(a.erledigt_am || '')).slice(0, 100)],
+  };
+  const an = Filter.tAnsicht || 'heute';
+  view.innerHTML = head('Aufgaben')
+    + `<form class="toolbar" id="tSchnell"><input class="input" name="titel" placeholder="Neue Aufgabe" aria-label="Neue Aufgabe" required>
+      <input class="input" type="date" name="faellig" value="${heute}" aria-label="Fällig am"><button class="btn primary">Hinzufügen</button></form>
+    <div class="toolbar tabs">${Object.entries(ANSICHTEN).map(([k, [t, l]]) => `<button type="button" class="btn sm${k === an ? ' primary' : ''}" data-ansicht="${k}">${t} (${l.length})</button>`).join('')}</div>
+    <div class="card" id="tListe">${aufgabenListe(ANSICHTEN[an][1])}</div>`;
+  $('.tabs', view).addEventListener('click', (ev) => { const k = ev.target.closest('button')?.dataset.ansicht; if (k) { Filter.tAnsicht = k; router(); } });
+  $('#tSchnell').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    try { await api('aufgaben', 'POST', { titel: ev.target.elements.titel.value.trim(), faellig: ev.target.elements.faellig.value }); toast('Angelegt'); badgeSync(); router(); }
+    catch (e) { toast(e.message); }
+  });
+  aufgabenBinden($('#tListe'), alle, kunden, auftraege);
+};
+
+/* ---------- Einstellungen: Aufgaben-Vorlagen je Paket ---------- */
+async function vorlagenKarte(box, pakete) {
+  const vorlagen = await api('aufgaben_vorlagen');
+  const felder = [
+    { key: 'paket_id', label: 'Paket', type: 'select', required: true, options: pakete.map(p => [p.id, p.name]) },
+    { key: 'titel', label: 'Aufgabe', required: true },
+    { key: 'tage_offset', label: 'Fällig: Tage nach dem Auftrag (negativ: davor)', type: 'text' },
+    { key: 'prioritaet', label: 'Priorität', type: 'select', options: [['Mittel', 'Mittel'], ['Hoch', 'Hoch'], ['Niedrig', 'Niedrig']] },
+    { key: 'sort', label: 'Reihenfolge', type: 'number' },
+  ];
+  const tage = n => n === 0 ? 'am Tag des Auftrags' : n > 0 ? `${n} ${n === 1 ? 'Tag' : 'Tage'} danach` : `${-n} ${n === -1 ? 'Tag' : 'Tage'} vorher`;
+  box.innerHTML = `<h2>Aufgaben je Paket</h2><p class="muted small">Diese Aufgaben entstehen automatisch beim Anlegen eines Auftrags.</p>
+    ${pakete.map(p => { const v = vorlagen.filter(x => x.paket_id === p.id); return `<details><summary><b>${esc(p.name)}</b> <span class="muted small">(${v.length})</span></summary>
+      <ul class="kontakte">${v.map(x => `<li><button type="button" class="linkbtn" data-av="${x.id}">${esc(x.titel)}</button> <span class="muted small">${tage(x.tage_offset || 0)}</span></li>`).join('')}</ul>
+      <button type="button" class="btn sm" data-avneu="${p.id}">Aufgabe hinzufügen</button></details>`; }).join('')}`;
+  box.addEventListener('click', (ev) => {
+    const b = ev.target.closest('button')?.dataset || {};
+    if (b.av) editRecord('aufgaben_vorlagen', 'Vorlage bearbeiten', felder, byId(vorlagen, b.av));
+    if (b.avneu) editRecord('aufgaben_vorlagen', 'Vorlage hinzufügen', felder, { paket_id: Number(b.avneu), tage_offset: 0 });
+  });
+}
 
 /* ---------- App auf dem Home-Bildschirm und Push (nach dem Vorbild des Hubs) ---------- */
 /* iPhone: Push geht nur, wenn das Tool als App auf dem Home-Bildschirm liegt (ab iOS 16.4) */

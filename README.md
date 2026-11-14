@@ -3,7 +3,8 @@
 Interne Arbeitsoberfläche für Aufträge, Zahlungen, Bildauslieferung und Verträge.
 Regeln und Server: `CLAUDE.md`. Funktionsumfang und Bauphasen: `PLANUNG.md`.
 
-Stand: **Phase 7** (iPhone-App: Manifest, App-Symbole, Service Worker ohne Zwischenspeicher, Push-Mitteilungen mit VAPID wie im Hub, Zahl am App-Symbol, Installationshinweis).
+Stand: **Phase 8** (Eigene Termine mit Wiederholung und Erinnerung, Kalender mit Woche und Tag, Warnung bei Überschneidungen, Aufgaben mit Ansichten und Vorlagen je Paket, wiederkehrende Aufgaben, Push-Erinnerungen, fremder Kalender per ICS-Link).
+Davor Phase 7: iPhone-App: Manifest, App-Symbole, Service Worker ohne Zwischenspeicher, Push-Mitteilungen mit VAPID wie im Hub, Zahl am App-Symbol, Installationshinweis.
 Davor Phase 6: Startseite mit Kennzahlen, Kalender (Monat und Liste) mit Aufträgen und Fristen, Kalender-Abo fürs iPhone, Serien-Anlage, Sicherung außerhalb des Servers, Anleitung für Deployment und Wiederherstellung.
 Davor Phase 5: Verträge mit berechneter Kündigungsfrist und automatischer Verlängerung, PDF-Upload, geschützter Download, Dokumente je Kunde.
 Davor Phase 4: Bildauslieferung: Galerie-Links mit Ablaufdatum, Lieferfrist-Ampel, Nachrichtenvorlagen.

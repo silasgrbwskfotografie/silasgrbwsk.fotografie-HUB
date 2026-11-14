@@ -93,7 +93,6 @@ function head(title, sub) {
 /* Seiten, die in späteren Phasen gebaut werden */
 const LATER = {
   mail: [9, 'Postfach wie im Emden Tigers Hub, mit mehreren Konten.'],
-  aufgaben: [8, 'Aufgaben mit Fälligkeit, Vorlagen je Paket und Erinnerungen.'],
 };
 Object.entries(LATER).forEach(([key, [phase, text]]) => {
   App.pages[key] = async (view) => {
